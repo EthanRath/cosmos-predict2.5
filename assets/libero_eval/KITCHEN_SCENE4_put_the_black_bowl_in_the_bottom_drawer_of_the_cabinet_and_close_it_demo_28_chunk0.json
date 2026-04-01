@@ -1,0 +1,6 @@
+{
+    "inference_type": "video2world",
+    "name": "KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it_demo_28_chunk0",
+    "prompt": "A Franka robot arm completing the following LIBERO task: put the black bowl in the bottom drawer of the cabinet and close it. The video is continuous with no cuts, blank frames, or transitions. The camera's view remains clear with no obstructions.",
+    "input_path": "/mnt/ssd2/libero/eval_set2//images/KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it_demo_28_chunk0.jpg"
+}

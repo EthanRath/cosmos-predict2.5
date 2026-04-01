@@ -1,0 +1,6 @@
+{
+    "inference_type": "video2world",
+    "name": "LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket_demo_30_chunk2",
+    "prompt": "A Franka robot arm completing the following LIBERO task: put both the cream cheese box and the butter in the basket. The video is continuous with no cuts, blank frames, or transitions. The camera's view remains clear with no obstructions.",
+    "input_path": "/mnt/ssd2/libero/eval_set2//images/LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket_demo_30_chunk2.jpg"
+}

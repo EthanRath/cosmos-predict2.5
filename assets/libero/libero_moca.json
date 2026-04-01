@@ -1,0 +1,6 @@
+{
+    "inference_type": "image2world",
+    "name": "libero_moca",
+    "input_path": "libero_moca.jpg",
+    "prompt_path": "libero_moca.txt"
+}

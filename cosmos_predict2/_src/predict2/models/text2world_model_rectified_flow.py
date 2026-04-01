@@ -813,7 +813,7 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
 
         # Latent state
         raw_state = data_batch[self.input_image_key if is_image_batch else self.input_data_key]
-        latent_state = self.encode(raw_state).contiguous().float()
+        latent_state = self.encode(raw_state).contiguous().float() # this is where the ENCODER is called <-
 
         # Condition
         condition = self.conditioner(data_batch)

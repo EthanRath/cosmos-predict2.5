@@ -796,7 +796,6 @@ class WanVAE:
     def count_param(self):
         return sum(p.numel() for p in self.model.parameters())
 
-    @torch.no_grad()
     def encode(self, videos, clear_encoder_cache=True):
         """
         videos: A list of videos each with shape [C, T, H, W].
@@ -959,9 +958,10 @@ class WanVAE:
 
 
 class Wan2pt1VAEInterface(VideoTokenizerInterface):
-    def __init__(self, chunk_duration: int = 81, load_mean_std=False, **kwargs):
+    def __init__(self, chunk_duration: int = 81, load_mean_std=False, enable_grad: bool = False, **kwargs):
         self.keep_decoder_cache = kwargs.get("keep_decoder_cache", False)
         self.keep_encoder_cache = kwargs.get("keep_encoder_cache", False)
+        self.enable_grad = enable_grad
         self.model = WanVAE(
             dtype=torch.bfloat16,
             is_amp=False,
@@ -996,7 +996,9 @@ class Wan2pt1VAEInterface(VideoTokenizerInterface):
         self.model.model.clear_cache()
 
     def encode(self, state: torch.Tensor) -> torch.Tensor:
-        latents = self.model.encode(state, clear_encoder_cache=not self.keep_encoder_cache)
+        grad_context = torch.enable_grad if self.enable_grad else nullcontext
+        with grad_context():
+            latents = self.model.encode(state, clear_encoder_cache=not self.keep_encoder_cache)
         num_frames = latents.shape[2]
         if num_frames == 1:
             return (latents - self.model.img_mean.type_as(latents)) / self.model.img_std.type_as(latents)
