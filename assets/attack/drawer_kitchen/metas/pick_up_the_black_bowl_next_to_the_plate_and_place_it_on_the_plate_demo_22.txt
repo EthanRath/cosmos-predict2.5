@@ -1,0 +1,1 @@
+Use the franka robot arm to pick up the black bowl next to the plate and place it on the plate

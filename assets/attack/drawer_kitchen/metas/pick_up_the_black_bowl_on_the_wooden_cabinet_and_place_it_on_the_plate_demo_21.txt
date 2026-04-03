@@ -1,0 +1,1 @@
+Use the franka robot arm to pick up the black bowl on the wooden cabinet and place it on the plate
