@@ -67,6 +67,7 @@ from cosmos_predict2._src.predict2.inference.video2world import (   # noqa: E402
 from cosmos_predict2._src.predict2.models.text2world_model_rectified_flow import (  # noqa: E402
     IS_PREPROCESSED_KEY,
 )
+import cosmos_predict2._src.predict2.inference.get_t5_emb as _t5_mod  # noqa: E402
 from test_vae_encoder import load_and_preprocess_video, normalize_video  # noqa: E402
 from attack.white_box import pgd                                          # noqa: E402
 
@@ -187,7 +188,7 @@ def main():
                         default="cosmos_predict2/_src/predict2/configs/video2world/config.py")
     args = parser.parse_args()
 
-    device = "cuda"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     H, W = [int(x) for x in args.resolution.split(",")]
     num_pixel_frames  = (args.num_latent_video_frames - 1) * 4 + 1
     frames_to_extract = 4 * (args.num_latent_conditional_frames - 1) + 1
@@ -221,7 +222,8 @@ def main():
     # ------------------------------------------------------------------
     # 3. Compute T5 embeddings for both prompts (text encoder still on GPU)
     # ------------------------------------------------------------------
-    video_bf16 = pad_video(raw_state, frames_to_extract, required_pixel_frames).to(dtype=torch.bfloat16)
+    compute_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    video_bf16 = pad_video(raw_state, frames_to_extract, required_pixel_frames).to(dtype=compute_dtype)
 
     print("Computing T5 embeddings for true prompt...")
     data_batch_true = inference._get_data_batch_input(
@@ -244,21 +246,30 @@ def main():
     # ------------------------------------------------------------------
     # 4. Offloading sequence (mirrors generate_vid2world)
     # ------------------------------------------------------------------
-    if inference.offload_text_encoder and model.text_encoder is not None:
-        if hasattr(model.text_encoder, "model") and model.text_encoder.model is not None:
-            model.text_encoder.model = model.text_encoder.model.to("cpu")
-        torch.cuda.empty_cache()
+    if inference.offload_text_encoder:
+        # Offload model-internal text encoder if present
+        if model.text_encoder is not None:
+            if hasattr(model.text_encoder, "model") and model.text_encoder.model is not None:
+                model.text_encoder.model = model.text_encoder.model.to("cpu")
+        # Offload the global T5 singleton from get_t5_emb (used when model.text_encoder is None)
+        if _t5_mod.cosmos_encoder is not None:
+            print("Offloading global T5 singleton to CPU...")
+            _t5_mod.cosmos_encoder.text_encoder = _t5_mod.cosmos_encoder.text_encoder.to("cpu")
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
     if inference.offload_tokenizer:
         if hasattr(model.tokenizer, "encoder") and model.tokenizer.encoder is not None:
-            model.tokenizer.encoder = model.tokenizer.encoder.to("cuda")
-        torch.cuda.empty_cache()
+            model.tokenizer.encoder = model.tokenizer.encoder.to(device)
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
     if inference.offload_diffusion_model:
-        model.net = model.net.to("cuda")
+        model.net = model.net.to(device)
         if hasattr(model, "conditioner") and model.conditioner is not None:
-            model.conditioner = model.conditioner.to("cuda")
-        torch.cuda.empty_cache()
+            model.conditioner = model.conditioner.to(device)
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # 5. Freeze DiT and tokenizer parameters so no gradient buffers are
