@@ -1,0 +1,41 @@
+{
+  "attack_type": "vae",
+
+  "model": {
+    "experiment_name": "predict2_video2world_training_2b_libero_480",
+    "ckpt_path": "/home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/8fbc6188fa2f2e4ab585dc6aac3edd0e9d8a3670/model.pt",
+    "vae_pth": "/home/ethan/.cache/huggingface/hub/models--nvidia--Cosmos-Predict2.5-2B/snapshots/6787e176dce74a101d922174a95dba29fa5f0c55/tokenizer.pth",
+    "config_file": "cosmos_predict2/_src/predict2/configs/video2world/config.py",
+    "resolution": "432,432",
+    "num_latent_video_frames": 6,
+    "num_latent_conditional_frames": 2,
+    "offload_diffusion_model": true,
+    "offload_text_encoder": true,
+    "offload_tokenizer": true
+  },
+
+  "attack_params": {
+    "steps": 20,
+    "alpha": 0.00392,
+    "eps": 0.0628
+  },
+
+  "eval_params": {
+    "guidance": 7.0,
+    "num_steps": 35,
+    "seed": 1
+  },
+
+  "experiments": [
+    {
+      "video_path":    "cosmos-predict2.5/assets/attack/k_1.mp4",
+      "attack_target": "cosmos-predict2.5/assets/attack/k_2.mp4",
+      "eval_prompt":   "Use the franka robot arm to pick up the black bowl next to the cookie box and place it on the plate"
+    },
+    {
+      "video_path":    "cosmos-predict2.5/assets/attack/k_2.mp4",
+      "attack_target": "cosmos-predict2.5/assets/attack/k_1.mp4",
+      "eval_prompt":   "Use the franka robot arm to turn on the stove and place the moka pot on it"
+    }
+  ]
+}
