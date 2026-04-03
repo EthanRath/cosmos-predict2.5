@@ -57,21 +57,12 @@ def load_and_preprocess_video(
     video_path: str,
     resolution: list[int],
     num_video_frames: int,
-    num_latent_conditional_frames: int = 2,
 ) -> torch.Tensor:
     """
-    Load a video, extract the last (4*(num_latent_conditional_frames-1)+1) frames,
-    pad the remainder with the last frame, resize, and return a uint8 tensor of
-    shape (1, C, T, H, W) ready for the model.
-
-    Mirrors read_and_process_video() in inference/video2world.py exactly.
+    Load a video, extract the first num_video_frames frames, resize to resolution,
+    and return a uint8 tensor of shape (1, C, T, H, W).
     """
     from cosmos_predict2._src.imaginaire.utils.easy_io import easy_io
-
-    if num_latent_conditional_frames not in [1, 2]:
-        raise ValueError(
-            f"num_latent_conditional_frames must be 1 or 2, got {num_latent_conditional_frames}"
-        )
 
     video_frames, video_metadata = easy_io.load(video_path)  # (T, H, W, C) numpy
     print(f"Loaded video: shape={video_frames.shape}, metadata={video_metadata}")
@@ -81,35 +72,21 @@ def load_and_preprocess_video(
     video_tensor = video_tensor.permute(3, 0, 1, 2)
 
     available_frames = video_tensor.shape[1]
-    frames_to_extract = 4 * (num_latent_conditional_frames - 1) + 1
-
-    if available_frames < frames_to_extract:
+    if available_frames < num_video_frames:
         raise ValueError(
-            f"Video has only {available_frames} frames but needs at least "
-            f"{frames_to_extract} frames for num_latent_conditional_frames="
-            f"{num_latent_conditional_frames}"
+            f"Video has only {available_frames} frames but {num_video_frames} were requested"
         )
 
-    C, _, H, W = video_tensor.shape
-    full_video = torch.zeros(C, num_video_frames, H, W)
-
-    start_idx = available_frames - frames_to_extract
-    extracted = video_tensor[:, start_idx:, :, :]
-    full_video[:, :frames_to_extract, :, :] = extracted
-
-    if frames_to_extract < num_video_frames:
-        last_frame = extracted[:, -1:, :, :]
-        padding = num_video_frames - frames_to_extract
-        full_video[:, frames_to_extract:, :, :] = last_frame.repeat(1, padding, 1, 1)
+    video_tensor = video_tensor[:, :num_video_frames, :, :]  # (C, T, H, W)
 
     # (C, T, H, W) -> (T, C, H, W) for resize, then back
-    full_video = full_video.permute(1, 0, 2, 3)            # (T, C, H, W)
-    full_video = (full_video * 255.0).to(torch.uint8)
-    full_video = resize_input(full_video, resolution)       # (T, C, H, W) uint8
+    video_tensor = video_tensor.permute(1, 0, 2, 3)          # (T, C, H, W)
+    video_tensor = (video_tensor * 255.0).to(torch.uint8)
+    video_tensor = resize_input(video_tensor, resolution)    # (T, C, H, W) uint8
 
     # (T, C, H, W) -> (1, C, T, H, W)
-    full_video = full_video.unsqueeze(0).permute(0, 2, 1, 3, 4)
-    return full_video  # (1, C, T, H, W) uint8
+    video_tensor = video_tensor.unsqueeze(0).permute(0, 2, 1, 3, 4)
+    return video_tensor  # (1, C, T, H, W) uint8
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +103,7 @@ def normalize_video(video: torch.Tensor, device: str = "cuda") -> torch.Tensor:
 # VAE loader
 # ---------------------------------------------------------------------------
 
-def load_vae(vae_pth: str, device: str = "cuda") -> "Wan2pt1VAEInterface":
+def load_vae(vae_pth: str, device: str = "cuda", enable_grad: bool = True) -> "Wan2pt1VAEInterface":
     """Instantiate only the Wan2pt1VAEInterface (VAE encoder/decoder)."""
     from cosmos_predict2._src.predict2.tokenizers.wan2pt1 import Wan2pt1VAEInterface
 
@@ -136,7 +113,7 @@ def load_vae(vae_pth: str, device: str = "cuda") -> "Wan2pt1VAEInterface":
         # no s3 credentials needed for a local path
         temporal_window=4,
         is_parallel=False,
-        enable_grad=True,
+        enable_grad=enable_grad,
     )
     # The WanVAE model was already placed on device='cuda' by default in _video_vae.
     # If the device arg is not cuda, move it.
@@ -159,18 +136,21 @@ def main():
         help="Target resolution [H W] (default: 720 1280)",
     )
     parser.add_argument(
-        "--num_latent_conditional_frames", type=int, default=2,
-        help="Number of latent conditional frames from the input video (1 or 2). "
-             "Determines how many pixel frames are extracted (4*(n-1)+1).",
-    )
-    parser.add_argument(
         "--num_latent_video_frames", type=int, default=31,
-        help="Total latent temporal length expected by the model (default: 31). "
+        help="Number of latent frames to encode (default: 31). "
              "Pixel frames = (num_latent_video_frames - 1) * 4 + 1.",
     )
     parser.add_argument(
         "--output_path", default=None,
         help="Optional path to save the latent tensor (.pt)",
+    )
+    parser.add_argument(
+        "--enable_grad", action="store_true", default=True,
+        help="Compute gradients through the VAE encoder (default: True).",
+    )
+    parser.add_argument(
+        "--no_grad", dest="enable_grad", action="store_false",
+        help="Disable gradient computation through the VAE encoder.",
     )
     args = parser.parse_args()
 
@@ -186,18 +166,17 @@ def main():
         video_path=args.video_path,
         resolution=args.resolution,
         num_video_frames=num_pixel_frames,
-        num_latent_conditional_frames=args.num_latent_conditional_frames,
     )
     print(f"Preprocessed video shape : {video_uint8.shape}, dtype={video_uint8.dtype}")
 
     # 2. Normalize to [-1, 1] and move to GPU  (matches _normalize_video_databatch_inplace)
-    raw_state = normalize_video(video_uint8, device=device).requires_grad_(True)
+    raw_state = normalize_video(video_uint8, device=device).requires_grad_(args.enable_grad)
     print(f"Normalised raw_state     : shape={raw_state.shape}, dtype={raw_state.dtype}, "
           f"range=[{raw_state.min():.3f}, {raw_state.max():.3f}]")
 
     args.vae_pth = "/home/ethan/.cache/huggingface/hub/models--nvidia--Cosmos-Predict2.5-2B/snapshots/6787e176dce74a101d922174a95dba29fa5f0c55/tokenizer.pth"
     # 3. Load the VAE (only model on GPU)
-    tokenizer = load_vae(args.vae_pth, device=device)
+    tokenizer = load_vae(args.vae_pth, device=device, enable_grad=args.enable_grad)
 
     vram_before = torch.cuda.memory_allocated(device) / 1e9
     print(f"VRAM after VAE load      : {vram_before:.2f} GB")
@@ -205,9 +184,10 @@ def main():
     # 4. Encode  (mirrors text2world_model_rectified_flow.py:816)
     print("Running encoder...")
     latent = tokenizer.encode(raw_state).contiguous().float()
-    loss = latent.sum()
-    loss.backward()
-    print("Gradients ", raw_state.grad)  # gradient w.r.t. the input pixels
+    if args.enable_grad:
+        loss = latent.sum()
+        loss.backward()
+        print("Gradients ", raw_state.grad)  # gradient w.r.t. the input pixels
 
     print(f"Latent shape             : {latent.shape}")   # (1, 16, T_lat, H_lat, W_lat)
     print(f"Latent dtype             : {latent.dtype}")

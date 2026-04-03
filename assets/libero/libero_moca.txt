@@ -1,1 +1,1 @@
-A Franka robot arm completing the following LIBERO task: turn on the stove and place the moka pot on it
+Use the franka robot arm to turn on the stove and place the moka pot on it
