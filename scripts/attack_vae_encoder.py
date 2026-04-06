@@ -74,7 +74,7 @@ def main():
     print(f"Latent T frames : {args.num_latent_video_frames}")
     print(f"Pixel T frames  : {num_pixel_frames}")
     print(f"Epsilon {args.eps}")
-    inverse_attack =  args.video_path == args.attack_target
+    inverse_attack =  args.video_path != args.attack_target
     print(f"Inverse Attack {inverse_attack}")
 
     # ------------------------------------------------------------------
@@ -115,11 +115,15 @@ def main():
     # 5. Run PGD
     # ------------------------------------------------------------------
     cos_loss = torch.nn.CosineSimilarity(dim=1)
+    cos_sim = torch.nn.functional.cosine_similarity
+    encode_fn = lambda x: tokenizer.encode(x).contiguous().float()
+    adv_gt_z = encode_fn(raw_state)
+    sim = 1-cos_sim(encoded_target, adv_gt_z, dim=1)
+    print(f"Sim Shape {sim.shape}")
     if inverse_attack:
-        loss_fn = lambda x, y: -cos_loss(x,y).mean()
+        loss_fn = lambda x, y: -cos_loss(x*sim,y).mean()
     else:
         loss_fn = lambda x, y: cos_loss(x,y).mean()
-    encode_fn = lambda x: tokenizer.encode(x).contiguous().float()
 
     print("Running PGD attack...")
     x_adv = pgd(
@@ -166,7 +170,7 @@ python cosmos-predict2.5/scripts/attack_vae_encoder.py \
     --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \
     --attack_target cosmos-predict2.5/assets/attack/k_2.mp4 \
     --vae_pth /home/ethan/.cache/huggingface/hub/models--nvidia--Cosmos-Predict2.5-2B/snapshots/6787e176dce74a101d922174a95dba29fa5f0c55/tokenizer.pth \
-    --resolution 432 432 \
-    --num_latent_video_frames 6 \
+    --resolution 768 768 \
+    --num_latent_video_frames 4 \
     --eps 0.0628
 """
