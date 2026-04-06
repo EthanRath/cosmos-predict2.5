@@ -325,8 +325,12 @@ def main():
             model, x_padded, condition_true, args.timestep, args.num_attack_layers
         )
 
-    mse_loss = nn.MSELoss()
-    loss_fn  = lambda pred, tgt: mse_loss(pred, tgt)
+    # Use torch.dot instead of nn.CosineSimilarity: dot() does not materialise
+    # the full element-wise x*y tensor in the autograd graph, saving ~4-8 GB
+    # of peak VRAM on 1B-element activation vectors.
+    # ||target|| is constant so we precompute it once outside the loss closure.
+    target_norm = target_acts.norm()
+    loss_fn = lambda x, y: 1 - torch.dot(x, y) / (x.norm() * target_norm)
 
     # ------------------------------------------------------------------
     # 9. Run PGD
