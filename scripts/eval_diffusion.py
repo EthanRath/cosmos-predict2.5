@@ -104,6 +104,9 @@ def main():
     # ------------------------------------------------------------------
     if is_rank0:
         print("Loading Video2World model...")
+        print(args.offload_diffusion_model)
+        print(args.offload_text_encoder)
+        print(args.offload_tokenizer)
     inference = Video2WorldInference(
         experiment_name=args.experiment_name,
         ckpt_path=args.ckpt_path,
@@ -228,11 +231,11 @@ if __name__ == "__main__":
 
 """
 torchrun --nproc_per_node=2 cosmos-predict2.5/scripts/eval_diffusion.py \
-    --adv_path attack/outputs/1775161186/x_adv.pt \
+    --adv_path attack/outputs/1775492690/x_adv.pt \
     --experiment_name predict2_video2world_training_2b_libero_480 \
     --ckpt_path /home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/8fbc6188fa2f2e4ab585dc6aac3edd0e9d8a3670/model.pt \
     --prompt "Use the franka robot arm to pick up the black bowl next to the cookie box and place it on the plate" \
-    --resolution 432,432 \
+    --resolution 768,768 \
     --num_latent_conditional_frames 2 \
     --context_parallel_size 2 \
     --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \

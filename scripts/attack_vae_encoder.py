@@ -117,8 +117,9 @@ def main():
     cos_loss = torch.nn.CosineSimilarity(dim=1)
     cos_sim = torch.nn.functional.cosine_similarity
     encode_fn = lambda x: tokenizer.encode(x).contiguous().float()
-    adv_gt_z = encode_fn(raw_state)
-    sim = 1-cos_sim(encoded_target, adv_gt_z, dim=1)
+    with torch.no_grad():
+        adv_gt_z = encode_fn(raw_state)
+        sim = 1-cos_sim(encoded_target, adv_gt_z, dim=1)
     print(f"Sim Shape {sim.shape}")
     if inverse_attack:
         loss_fn = lambda x, y: -cos_loss(x*sim,y).mean()

@@ -1,0 +1,8 @@
+{
+    "inference_type": "video2world",
+    "seed": 1,
+    "name": "test",
+    "prompt": "Use the franka robot arm to put the white mug on the plate",
+    "input_path": "/mnt/ssd2/libero/test_3_attack2.jpg",
+    "negative_prompt": "The video captures a series of frames showing ugly scenes, static with no motion, motion blur, unrealistic physical interactions, over-saturation, shaky footage, low resolution, grainy texture, pixelated images, poorly lit areas, underexposed and overexposed scenes, poor color balance, washed out colors, choppy sequences, jerky movements, low frame rate, artifacting, color banding, unnatural transitions, outdated special effects, fake elements, unconvincing visuals, poorly edited content, jump cuts, visual noise, and flickering. Overall, the video is of poor quality."
+}
