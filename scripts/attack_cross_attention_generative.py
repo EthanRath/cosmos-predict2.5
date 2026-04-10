@@ -31,19 +31,19 @@ Gradient flow:
     Parameters of DiT and tokenizer are frozen (no parameter gradient buffers).
 
 Usage:
-    python cosmos-predict2.5/scripts/attack_cross_attention_generative.py \\
-        --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \\
-        --true_prompt "Use the franka robot arm to pick up the black bowl" \\
-        --target_prompt "Use the franka robot arm to open the drawer" \\
-        --experiment_name predict2_video2world_training_2b_libero_480 \\
-        --ckpt_path /path/to/model.pt \\
-        --resolution 432,432 \\
-        --num_latent_video_frames 6 \\
-        --num_latent_conditional_frames 2 \\
-        --num_denoise_steps 5 \\
-        --attack_layers 14 15 16 17 18 \\
-        --steps 20 --alpha 0.00392 --eps 0.0628 \\
-        --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \\
+    python cosmos-predict2.5/scripts/attack_cross_attention_generative.py \
+        --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \
+        --true_prompt "Use the franka robot arm to pick up the black bowl" \
+        --target_prompt "Use the franka robot arm to open the drawer" \
+        --experiment_name predict2_video2world_training_2b_libero_480 \
+        --ckpt_path /home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/47d14a41779c654c213600ec1c35c9ebd89dd992/model.pt \
+        --resolution 432,432 \
+        --num_latent_video_frames 6 \
+        --num_latent_conditional_frames 2 \
+        --num_denoise_steps 5 \
+        --attack_layers 14 15 16 17 18 \
+        --steps 20 --alpha 0.00392 --eps 0.0628 \
+        --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \
         --offload_diffusion_model --offload_tokenizer --offload_text_encoder
 """
 
@@ -145,7 +145,7 @@ def get_crossattn_after_denoise(
     # --- 2. Initialise at t=1 (pure noise for gen frames, clean for cond frames) ---
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
-    noise = torch.randn_like(latent, generator=gen)
+    noise = torch.randn(latent.shape, generator=gen, device=device, dtype=latent.dtype)
 
     latent_det = latent.detach()
     x_t = latent_det * cond_mask + noise * (1 - cond_mask)   # detached; no grad needed yet
@@ -478,20 +478,20 @@ if __name__ == "__main__":
 
 
 """
-python cosmos-predict2.5/scripts/attack_cross_attention_generative.py \\
-    --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \\
-    --true_prompt "Use the franka robot arm to pick up the black bowl next to the cookie box and place it on the plate" \\
-    --target_prompt "Use the franka robot arm to open the drawer and place the cookie box in it" \\
-    --experiment_name predict2_video2world_training_2b_libero_480 \\
-    --ckpt_path /home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/8fbc6188fa2f2e4ab585dc6aac3edd0e9d8a3670/model.pt \\
-    --resolution 432,432 \\
-    --num_latent_video_frames 6 \\
-    --num_latent_conditional_frames 2 \\
-    --num_denoise_steps 5 \\
-    --attack_layers 14 15 16 17 18 \\
-    --steps 20 --alpha 0.00392 --eps 0.0628 \\
-    --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \\
-    --offload_diffusion_model \\
-    --offload_tokenizer \\
+python cosmos-predict2.5/scripts/attack_cross_attention_generative.py \
+    --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \
+    --true_prompt "Use the franka robot arm to pick up the black bowl next to the cookie box and place it on the plate" \
+    --target_prompt "Use the franka robot arm to open the drawer and place the cookie box in it" \
+    --experiment_name predict2_video2world_training_2b_libero_480 \
+    --ckpt_path /home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/8fbc6188fa2f2e4ab585dc6aac3edd0e9d8a3670/model.pt \
+    --resolution 432,432 \
+    --num_latent_video_frames 6 \
+    --num_latent_conditional_frames 2 \
+    --num_denoise_steps 5 \
+    --attack_layers 14 15 16 17 18 \
+    --steps 20 --alpha 0.00392 --eps 0.0628 \
+    --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \
+    --offload_diffusion_model \
+    --offload_tokenizer \
     --offload_text_encoder
 """
