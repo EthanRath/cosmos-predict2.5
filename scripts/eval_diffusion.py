@@ -231,11 +231,11 @@ if __name__ == "__main__":
 
 """
 torchrun --nproc_per_node=2 cosmos-predict2.5/scripts/eval_diffusion.py \
-    --adv_path attack/outputs/1775492690/x_adv.pt \
+    --adv_path attack/outputs/1775846358/x_adv.pt \
     --experiment_name predict2_video2world_training_2b_libero_480 \
-    --ckpt_path /home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/8fbc6188fa2f2e4ab585dc6aac3edd0e9d8a3670/model.pt \
+    --ckpt_path /home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/47d14a41779c654c213600ec1c35c9ebd89dd992/model.pt \
     --prompt "Use the franka robot arm to pick up the black bowl next to the cookie box and place it on the plate" \
-    --resolution 768,768 \
+    --resolution 432,432 \
     --num_latent_conditional_frames 2 \
     --context_parallel_size 2 \
     --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \

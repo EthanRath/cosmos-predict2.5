@@ -171,7 +171,7 @@ python cosmos-predict2.5/scripts/attack_vae_encoder.py \
     --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \
     --attack_target cosmos-predict2.5/assets/attack/k_2.mp4 \
     --vae_pth /home/ethan/.cache/huggingface/hub/models--nvidia--Cosmos-Predict2.5-2B/snapshots/6787e176dce74a101d922174a95dba29fa5f0c55/tokenizer.pth \
-    --resolution 768 768 \
+    --resolution 432 432 \
     --num_latent_video_frames 4 \
     --eps 0.0628
 """
