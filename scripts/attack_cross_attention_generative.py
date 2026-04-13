@@ -95,6 +95,26 @@ def pad_video(video, frames_to_extract, required_pixel_frames):
     return torch.cat([context, context[:, :, -1:, :, :].repeat(1, 1, padding, 1, 1)], dim=2)
 
 
+def move_condition_to_device(condition, device):
+    """Move all tensor attributes of a condition dataclass to `device`.
+    Uses object.__setattr__ to bypass frozen-dataclass restrictions."""
+    for attr in vars(condition):
+        val = getattr(condition, attr)
+        if isinstance(val, torch.Tensor):
+            object.__setattr__(condition, attr, val.to(device))
+    return condition
+
+
+def cond_dict_to_device(condition, device):
+    """Return condition.to_dict() with every tensor moved to `device`.
+    Called at each model.net() invocation to guarantee all DiT inputs are
+    on the correct device, regardless of how the condition was built."""
+    return {
+        k: v.to(device) if isinstance(v, torch.Tensor) else v
+        for k, v in condition.to_dict().items()
+    }
+
+
 # ---------------------------------------------------------------------------
 # Core: denoising steps + cross-attention capture
 # ---------------------------------------------------------------------------
@@ -107,7 +127,8 @@ def get_crossattn_after_denoise(
     num_denoise_steps,
     layer_indices,
     seed=42,
-    device="cuda",
+    vae_device="cuda",
+    dit_device="cuda",
 ):
     """
     Encode `video` through the VAE, run `num_denoise_steps` Euler denoising
@@ -117,72 +138,75 @@ def get_crossattn_after_denoise(
     Parameters
     ----------
     model              : Video2WorldModelRectifiedFlow
-    video              : (1, C, T_px, H, W) float32 on device, requires_grad or not
+    video              : (1, C, T_px, H, W) float32 on vae_device
     condition_denoise  : Video2WorldCondition used for the k-1 no_grad Euler steps
     condition_attn     : Video2WorldCondition whose T5 emb drives the final cross-attn
-                         (true_prompt for encode_fn, target_prompt for fixed target)
     num_denoise_steps  : int ≥ 1.  Total Euler steps.  First k-1 are no_grad;
                          last step runs with grad and captures cross-attn.
     layer_indices      : list[int] | None.  Block indices to capture.  None = all.
     seed               : int.  RNG seed for the initial noise sample.
-    device             : str.
+    vae_device         : str.  Device hosting the VAE encoder (e.g. "cuda:0").
+    dit_device         : str.  Device hosting the DiT (e.g. "cuda:1").
+                         When equal to vae_device this is single-GPU mode.
+                         When different, latent.to(dit_device) forms a differentiable
+                         cross-device bridge so gradients flow back through the VAE.
 
     Returns
     -------
-    flat (N,) float32 tensor with grad attached (grad flows through VAE encoder
-    via the conditional frame portion of x_in_final).
+    flat (N,) float32 tensor with grad attached.
     """
-    kw = model.tensor_kwargs   # e.g. {'device': 'cuda', 'dtype': torch.bfloat16}
+    kw = {"device": dit_device, "dtype": torch.bfloat16}
 
-    # --- 1. VAE encode (gradient enabled for the backward pass) ---
+    # --- 1. VAE encode on vae_device (gradient enabled for the backward pass) ---
     latent = model.tokenizer.encode(video).contiguous().float()  # (B, C, T_lat, H_lat, W_lat)
+
+    # Bridge to dit_device.  .to() is differentiable: gradient flows back to vae_device.
+    latent = latent.to(dit_device)
+
     B, C, T_lat, H_lat, W_lat = latent.shape
 
-    # Conditioning mask: 1 for cond frames (kept clean), 0 for generation frames
+    # Conditioning mask on dit_device
     cond_mask = condition_denoise.condition_video_input_mask_B_C_T_H_W \
-                    .repeat(1, C, 1, 1, 1).type_as(latent)   # (B, C, T_lat, H_lat, W_lat)
+                    .repeat(1, C, 1, 1, 1).type_as(latent)
 
     # --- 2. Initialise at t=1 (pure noise for gen frames, clean for cond frames) ---
-    gen = torch.Generator(device=device)
+    gen = torch.Generator(device=dit_device)
     gen.manual_seed(seed)
-    noise = torch.randn(latent.shape, generator=gen, device=device, dtype=latent.dtype)
+    noise = torch.randn(latent.shape, generator=gen, device=dit_device, dtype=latent.dtype)
 
     latent_det = latent.detach()
-    x_t = latent_det * cond_mask + noise * (1 - cond_mask)   # detached; no grad needed yet
+    x_t = latent_det * cond_mask + noise * (1 - cond_mask)
 
-    # Rectified flow schedule: t descends from 1 → 0 over num_denoise_steps+1 points
-    ts = torch.linspace(1.0, 0.0, num_denoise_steps + 1, device=device)
+    ts = torch.linspace(1.0, 0.0, num_denoise_steps + 1, device=dit_device)
 
     # --- 3. Early Euler steps (no grad) ---
     with torch.no_grad():
         for step_idx in range(num_denoise_steps - 1):
             t_cur  = ts[step_idx].item()
             t_next = ts[step_idx + 1].item()
-            dt     = t_next - t_cur           # negative (t decreasing)
+            dt     = t_next - t_cur
 
-            t_tensor = torch.full((B, T_lat), t_cur, device=device, dtype=latent.dtype)
-            # Pin cond frames to clean latent at every step (mirrors the model's denoise())
+            t_tensor = torch.full((B, T_lat), t_cur, device=dit_device, dtype=latent.dtype)
             x_in = latent_det * cond_mask + x_t * (1 - cond_mask)
 
-            v = model.net(
-                x_B_C_T_H_W  = x_in.to(**kw),
-                timesteps_B_T = t_tensor.to(**kw),
-                **condition_denoise.to_dict(),
-            )
+            with torch.cuda.device(dit_device):
+                v = model.net(
+                    x_B_C_T_H_W  = x_in.to(**kw),
+                    timesteps_B_T = t_tensor.to(**kw),
+                    **cond_dict_to_device(condition_denoise, dit_device),
+                )
             if isinstance(v, tuple):
                 v = v[0]
             v  = v.float()
             x_t = x_t + dt * v
-            # Re-pin cond frames (prevent drift)
             x_t = latent_det * cond_mask + x_t * (1 - cond_mask)
 
     # --- 4. Final Euler step (WITH grad) — cross-attn captured here ---
     t_cur    = ts[num_denoise_steps - 1].item()
-    t_tensor = torch.full((B, T_lat), t_cur, device=device, dtype=latent.dtype)
+    t_tensor = torch.full((B, T_lat), t_cur, device=dit_device, dtype=latent.dtype)
 
-    # latent has grad (cond frames); x_t is detached (gen frames).
-    # Gradient flows: cross-attn output → model.net → x_in_final
-    #                 → latent * cond_mask → VAE encoder → video (x_adv)
+    # latent (on dit_device, has grad via the .to() bridge) drives cond frames.
+    # Gradient: cross-attn → DiT → x_in_final → latent → .to(dit_device) → VAE → x_adv
     x_in_final = latent * cond_mask + x_t * (1 - cond_mask)
 
     # Register cross-attn hooks on the requested blocks
@@ -211,11 +235,12 @@ def get_crossattn_after_denoise(
             return output.detach()
         hooks.append(model.net.blocks[max_block].register_forward_hook(_detach_hook))
 
-    model.net(
-        x_B_C_T_H_W  = x_in_final.to(**kw),
-        timesteps_B_T = t_tensor.to(**kw),
-        **condition_attn.to_dict(),
-    )
+    with torch.cuda.device(dit_device):
+        model.net(
+            x_B_C_T_H_W  = x_in_final.to(**kw),
+            timesteps_B_T = t_tensor.to(**kw),
+            **cond_dict_to_device(condition_attn, dit_device),
+        )
 
     for h in hooks:
         h.remove()
@@ -227,6 +252,269 @@ def get_crossattn_after_denoise(
         )
 
     return torch.cat([captured[k].flatten() for k in sorted(captured.keys())])
+
+
+# ---------------------------------------------------------------------------
+# Alternating mode: latent-space PGD + pixel-space PGD (low VRAM)
+# ---------------------------------------------------------------------------
+
+def get_crossattn_from_latent(
+    model,
+    latent,
+    condition_denoise,
+    condition_attn,
+    num_denoise_steps,
+    layer_indices,
+    seed=42,
+    dit_device="cuda",
+):
+    """
+    Like get_crossattn_after_denoise but receives an already-encoded VAE latent
+    instead of a pixel video.  Gradient flows from cross-attn → DiT → latent
+    without touching the VAE encoder — enabling Phase 1 of the alternating attack.
+
+    Parameters
+    ----------
+    latent     : (B, C, T_lat, H_lat, W_lat) float32, may have requires_grad=True.
+    dit_device : str.  Device the DiT runs on.  Latent is moved here if needed.
+    All other parameters identical to get_crossattn_after_denoise.
+    """
+    kw = {"device": dit_device, "dtype": torch.bfloat16}
+
+    # Move latent to dit_device if it's not already there (differentiable).
+    latent = latent.to(dit_device)
+
+    B, C, T_lat, H_lat, W_lat = latent.shape
+
+    cond_mask = condition_denoise.condition_video_input_mask_B_C_T_H_W \
+                    .repeat(1, C, 1, 1, 1).type_as(latent)
+
+    gen = torch.Generator(device=dit_device)
+    gen.manual_seed(seed)
+    noise = torch.randn(latent.shape, generator=gen, device=dit_device, dtype=latent.dtype)
+
+    latent_det = latent.detach()
+    x_t = latent_det * cond_mask + noise * (1 - cond_mask)
+
+    ts = torch.linspace(1.0, 0.0, num_denoise_steps + 1, device=dit_device)
+
+    with torch.no_grad():
+        for step_idx in range(num_denoise_steps - 1):
+            t_cur  = ts[step_idx].item()
+            t_next = ts[step_idx + 1].item()
+            dt     = t_next - t_cur
+
+            t_tensor = torch.full((B, T_lat), t_cur, device=dit_device, dtype=latent_det.dtype)
+            x_in = latent_det * cond_mask + x_t * (1 - cond_mask)
+            with torch.cuda.device(dit_device):
+                v = model.net(
+                    x_B_C_T_H_W  = x_in.to(**kw),
+                    timesteps_B_T = t_tensor.to(**kw),
+                    **cond_dict_to_device(condition_denoise, dit_device),
+                )
+            if isinstance(v, tuple):
+                v = v[0]
+            v = v.float()
+            x_t = x_t + dt * v
+            x_t = latent_det * cond_mask + x_t * (1 - cond_mask)
+
+    # Final step with grad — latent contributes via cond_mask portion
+    t_cur    = ts[num_denoise_steps - 1].item()
+    t_tensor = torch.full((B, T_lat), t_cur, device=dit_device, dtype=latent.dtype)
+    x_in_final = latent * cond_mask + x_t * (1 - cond_mask)
+
+    captured  = {}
+    hooks     = []
+    n_blocks  = len(model.net.blocks)
+    idxs      = layer_indices if layer_indices is not None else list(range(n_blocks))
+    max_block = max(idxs) if idxs else n_blocks - 1
+
+    for idx in idxs:
+        if idx >= n_blocks or not hasattr(model.net.blocks[idx], "cross_attn"):
+            continue
+        def _make_hook(i):
+            def _hook(_m, _inp, output):
+                captured[i] = output[0] if isinstance(output, tuple) else output
+            return _hook
+        hooks.append(model.net.blocks[idx].cross_attn.register_forward_hook(_make_hook(idx)))
+
+    if max_block < n_blocks - 1:
+        def _detach_hook(_m, _inp, output):
+            if isinstance(output, tuple):
+                return (output[0].detach(),) + output[1:]
+            return output.detach()
+        hooks.append(model.net.blocks[max_block].register_forward_hook(_detach_hook))
+
+    with torch.cuda.device(dit_device):
+        model.net(
+            x_B_C_T_H_W  = x_in_final.to(**kw),
+            timesteps_B_T = t_tensor.to(**kw),
+            **cond_dict_to_device(condition_attn, dit_device),
+        )
+
+    for h in hooks:
+        h.remove()
+
+    if not captured:
+        raise RuntimeError("No cross-attn outputs captured from get_crossattn_from_latent.")
+
+    return torch.cat([captured[k].flatten() for k in sorted(captured.keys())])
+
+
+def pgd_latent(z_init, emb_target, crossattn_fn, loss_fn, steps, alpha, eps):
+    """
+    PGD in VAE latent space.  Unlike pixel-space PGD, latents are not bounded
+    to [-1, 1]; we project the perturbation to an L-inf ball of radius `eps`
+    around the initial latent.
+
+    Parameters
+    ----------
+    z_init       : (B, C, T, H, W) float32 detached latent tensor
+    emb_target   : fixed cross-attn target embedding
+    crossattn_fn : callable, takes latent → flat cross-attn embedding
+    loss_fn      : callable, takes (prediction, target) → scalar loss
+    steps        : int, number of PGD steps
+    alpha        : float, step size in latent space
+    eps          : float, L-inf ball radius in latent space
+
+    Returns
+    -------
+    z_adv : (B, C, T, H, W) float32 updated latent
+    """
+    
+    z_orig = z_init.clone().detach()
+    z_adv  = z_init.clone().detach()
+    
+    for _ in range(steps):
+        z_adv.requires_grad_(True)
+
+        attn = crossattn_fn(z_adv)
+        cost = loss_fn(attn, emb_target)
+        print(f"  [latent PGD] loss: {cost.item():.6f}", end="\r")
+
+        grad = torch.autograd.grad(cost, z_adv, retain_graph=False)[0]
+
+        z_adv  = z_adv.detach() - alpha * grad.sign()
+        delta  = torch.clamp(z_adv - z_orig, min=-eps, max=eps)
+        z_adv  = (z_orig + delta).detach()
+
+    print()
+    return z_adv
+
+
+def alternating_attack(
+    x_orig,
+    emb_target,
+    target_norm,
+    model,
+    condition_true,
+    frames_to_extract,
+    required_pixel_frames,
+    num_latent_conditional_frames,
+    num_denoise_steps,
+    layer_indices,
+    outer_steps,
+    embed_steps,
+    pixel_steps,
+    alpha,
+    eps,
+    embed_alpha,
+    embed_eps,
+    seed,
+    vae_device="cuda",
+    dit_device="cuda",
+    offload_net=False,
+):
+    """
+    Two-phase alternating attack (low VRAM):
+
+    Phase 1 — latent PGD (DiT backprop, no VAE backprop):
+        Encode x_adv → z with no_grad.  PGD in latent space to find z_star
+        whose cross-attn is closer to emb_target.
+        Gradient: cross-attn → DiT → z  (VAE encoder NOT in graph).
+
+    Phase 2 — pixel PGD (VAE backprop only, no DiT):
+        Only encode the conditioning frames (last frames_to_extract pixel frames),
+        giving num_latent_conditional_frames latent frames.  Match those against
+        z_star's conditioning portion using cosine distance.
+        Gradient: cos_dist(VAE_cond(x_adv), z_star_cond) → VAE → x_adv
+        (DiT NOT in graph, and only a small fraction of frames encoded → low VRAM).
+
+    VRAM savings vs end-to-end:
+      - DiT and VAE activation buffers never coexist.
+      - Phase 2 encodes only conditioning frames (e.g., 5 px frames → 2 lat frames)
+        instead of the full padded video (93 px frames).  This is the main fix for
+        OOM: attack_vae_encoder.py works because it encodes a small clip; Phase 2
+        now matches that behaviour.
+      - If offload_net=True, model.net is moved to CPU during Phase 2 and back
+        before Phase 1, freeing ~4 GB (2B params @ bfloat16).
+    """
+    x_adv = x_orig.clone().detach()
+
+    crossattn_loss_fn = lambda x, y: 1.0 - torch.dot(x.float(), y) / (x.float().norm() * target_norm)
+
+    for outer in range(outer_steps):
+        print(f"\nOuter iteration {outer + 1}/{outer_steps}")
+
+        # ------------------------------------------------------------------
+        # Phase 1: PGD in latent space  (DiT on GPU, VAE no-grad)
+        # ------------------------------------------------------------------
+        if offload_net and outer > 0:
+            print(f"  [offload] Moving DiT → {dit_device}")
+            model.net = model.net.to(dit_device)
+            torch.cuda.empty_cache()
+
+        with torch.no_grad():
+            x_padded = pad_video(x_adv, frames_to_extract, required_pixel_frames)
+            z_adv = model.tokenizer.encode(x_padded).contiguous().float()
+
+        print(f"  Phase 1 — latent PGD ({embed_steps} steps, alpha={embed_alpha}, eps={embed_eps})")
+
+        embed_fn = lambda z: get_crossattn_from_latent(
+            model, z, condition_true, condition_true,
+            num_denoise_steps, layer_indices, seed, dit_device,
+        )
+        z_star = pgd_latent(
+            z_adv, emb_target, embed_fn, crossattn_loss_fn,
+            steps=embed_steps, alpha=embed_alpha, eps=embed_eps,
+        )
+
+        # ------------------------------------------------------------------
+        # Phase 2: pixel-space PGD  (VAE only, DiT optionally offloaded)
+        # Only match conditioning latent frames — avoids encoding 93-frame
+        # padded video and dramatically cuts VRAM vs. Phase 1.
+        # ------------------------------------------------------------------
+        if offload_net:
+            print(f"  [offload] Moving DiT → CPU (freeing {dit_device})")
+            model.net = model.net.to("cpu")
+            torch.cuda.empty_cache()
+
+        print(f"  Phase 2 — pixel PGD  ({pixel_steps} steps, alpha={alpha:.5f}, eps={eps:.4f})")
+
+        # Target: only the conditioning portion of z_star (e.g., 2 latent frames)
+        z_star_cond      = z_star[:, :, :num_latent_conditional_frames, :, :].detach().float()
+        z_star_cond_flat = z_star_cond.flatten()
+        z_star_cond_norm = z_star_cond_flat.norm()
+
+        def vae_encode_cond(x):
+            # Extract last frames_to_extract pixel frames (the real conditioning content)
+            x_cond = x[:, :, -frames_to_extract:, :, :]
+            z_cond = model.tokenizer.encode(x_cond).contiguous().float()
+            return z_cond[:, :, :num_latent_conditional_frames, :, :].flatten()
+
+        vae_cos_loss = lambda z, z_t: 1.0 - torch.dot(z.float(), z_t) / (z.float().norm() * z_star_cond_norm)
+
+        x_adv = pgd(
+            x_adv, z_star_cond_flat, vae_encode_cond, vae_cos_loss,
+            steps=pixel_steps, alpha=alpha, eps=eps, device=device,
+        )
+
+    # Ensure DiT is back on dit_device after the last iteration
+    if offload_net:
+        model.net = model.net.to(dit_device)
+        torch.cuda.empty_cache()
+
+    return x_adv
 
 
 # ---------------------------------------------------------------------------
@@ -260,9 +548,32 @@ def main():
              "Default: all blocks.",
     )
     parser.add_argument("--seed",   type=int,   default=42,      help="RNG seed for initial noise (default: 42)")
-    parser.add_argument("--steps",  type=int,   default=20,      help="PGD steps (default: 20)")
-    parser.add_argument("--alpha",  type=float, default=1/255,   help="PGD step size (default: 1/255)")
-    parser.add_argument("--eps",    type=float, default=16/255,  help="PGD epsilon (default: 16/255)")
+    parser.add_argument("--steps",  type=int,   default=20,
+                        help="PGD steps (standard mode) or pixel-space PGD steps per outer "
+                             "iteration (alternating mode). (default: 20)")
+    parser.add_argument("--alpha",  type=float, default=1/255,   help="Pixel-space PGD step size (default: 1/255)")
+    parser.add_argument("--eps",    type=float, default=16/255,  help="Pixel-space PGD epsilon (default: 16/255)")
+    # Alternating mode
+    parser.add_argument(
+        "--alternating", action="store_true",
+        help="Enable two-phase alternating attack: Phase 1 PGD in latent space (DiT only, "
+             "no VAE backprop), Phase 2 PGD in pixel space (VAE only, no DiT backprop). "
+             "Halves peak VRAM vs. the standard end-to-end mode.",
+    )
+    parser.add_argument("--outer_steps",  type=int,   default=10,
+                        help="[alternating] Number of outer iterations (default: 10)")
+    parser.add_argument("--embed_steps",  type=int,   default=5,
+                        help="[alternating] Phase 1 latent-space PGD steps per outer iter (default: 5)")
+    parser.add_argument("--embed_alpha",  type=float, default=0.05,
+                        help="[alternating] Phase 1 latent-space step size (default: 0.05). "
+                             "Latents are ~[-5, 5], so scale accordingly.")
+    parser.add_argument("--embed_eps",    type=float, default=0.5,
+                        help="[alternating] Phase 1 latent-space L-inf epsilon (default: 0.5)")
+    parser.add_argument(
+        "--offload_net_between_phases", action="store_true",
+        help="[alternating] Move the DiT to CPU during Phase 2 and reload before Phase 1. "
+             "Frees ~4 GB VRAM at the cost of extra CPU↔GPU transfer time per outer iteration.",
+    )
     parser.add_argument("--offload_diffusion_model", action="store_true")
     parser.add_argument("--offload_text_encoder",    action="store_true")
     parser.add_argument("--offload_tokenizer",       action="store_true")
@@ -271,9 +582,22 @@ def main():
         "--config_file",
         default="cosmos_predict2/_src/predict2/configs/video2world/config.py",
     )
+    parser.add_argument(
+        "--split_gpus", action="store_true",
+        help="Place the VAE on cuda:0 and the DiT on cuda:1.  Gradient flows across "
+             "devices via differentiable .to() operations, so a single backward pass "
+             "spans both GPUs.  Requires two CUDA devices.  Halves per-device peak VRAM.",
+    )
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.split_gpus:
+        assert torch.cuda.device_count() >= 2, "split_gpus requires at least 2 CUDA devices"
+        vae_device = "cuda:0"
+        dit_device = "cuda:1"
+    else:
+        vae_device = device
+        dit_device = device
     H, W = [int(x) for x in args.resolution.split(",")]
     num_pixel_frames  = (args.num_latent_video_frames - 1) * 4 + 1
     frames_to_extract = 4 * (args.num_latent_conditional_frames - 1) + 1
@@ -285,13 +609,19 @@ def main():
     print(f"Denoising steps     : {args.num_denoise_steps}  (capture at t ≈ {eff_t:.3f})")
     print(f"Attack layers       : {args.attack_layers or 'all'}")
     print(f"PGD eps             : {args.eps:.4f}")
+    if args.alternating:
+        print(f"Mode                : ALTERNATING  "
+              f"(outer={args.outer_steps}, embed={args.embed_steps}×α={args.embed_alpha}/ε={args.embed_eps}, "
+              f"pixel={args.steps}×α={args.alpha:.5f}/ε={args.eps:.4f})")
+    else:
+        print(f"Mode                : standard end-to-end  (steps={args.steps})")
 
     # ------------------------------------------------------------------
     # 1. Load and preprocess video
     # ------------------------------------------------------------------
     print(f"\nLoading video: {args.video_path}")
     video_uint8 = load_and_preprocess_video(args.video_path, [H, W], num_pixel_frames)
-    raw_state   = normalize_video(video_uint8, device=device)   # (1, C, T, H, W) float32 [-1,1]
+    raw_state   = normalize_video(video_uint8, device=vae_device)  # (1, C, T, H, W) float32 [-1,1]
     print(f"Video shape         : {raw_state.shape}")
 
     # ------------------------------------------------------------------
@@ -346,21 +676,25 @@ def main():
         if _t5_mod.cosmos_encoder is not None:
             print("Offloading global T5 singleton to CPU...")
             _t5_mod.cosmos_encoder.text_encoder = _t5_mod.cosmos_encoder.text_encoder.to("cpu")
-        if device == "cuda":
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
 
     if inference.offload_tokenizer:
         if hasattr(model.tokenizer, "encoder") and model.tokenizer.encoder is not None:
-            model.tokenizer.encoder = model.tokenizer.encoder.to(device)
-        if device == "cuda":
-            torch.cuda.empty_cache()
+            model.tokenizer.encoder = model.tokenizer.encoder.to(vae_device)
+        torch.cuda.empty_cache()
 
     if inference.offload_diffusion_model:
-        model.net = model.net.to(device)
+        model.net = model.net.to(dit_device)
         if hasattr(model, "conditioner") and model.conditioner is not None:
-            model.conditioner = model.conditioner.to(device)
-        if device == "cuda":
-            torch.cuda.empty_cache()
+            model.conditioner = model.conditioner.to(dit_device)
+        torch.cuda.empty_cache()
+    elif args.split_gpus:
+        # No offloading requested but split_gpus: move DiT to dit_device explicitly
+        print(f"split_gpus: moving DiT → {dit_device}, VAE stays on {vae_device}")
+        model.net = model.net.to(dit_device)
+        if hasattr(model, "conditioner") and model.conditioner is not None:
+            model.conditioner = model.conditioner.to(dit_device)
+        torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # 5. Freeze DiT and tokenizer parameters
@@ -388,6 +722,10 @@ def main():
         num_conditional_frames=args.num_latent_conditional_frames,
     )
 
+    # Move condition tensors to the DiT device (T5 embeddings, masks, etc.)
+    move_condition_to_device(condition_true,   dit_device)
+    move_condition_to_device(condition_target, dit_device)
+
     model.tokenizer.enable_grad = True   # allow gradient through VAE encoder
 
     n_blocks = len(model.net.blocks)
@@ -406,12 +744,13 @@ def main():
     with torch.no_grad():
         target_acts = get_crossattn_after_denoise(
             model, video_padded,
-            condition_denoise=condition_true,    # denoising uses true_prompt trajectory
-            condition_attn=condition_target,     # but cross-attn is measured under target_prompt
+            condition_denoise=condition_true,
+            condition_attn=condition_target,
             num_denoise_steps=args.num_denoise_steps,
             layer_indices=layer_indices,
             seed=args.seed,
-            device=device,
+            vae_device=vae_device,
+            dit_device=dit_device,
         ).detach().float()
     print(f"Target activations shape : {target_acts.shape}")
 
@@ -428,26 +767,53 @@ def main():
             num_denoise_steps=args.num_denoise_steps,
             layer_indices=layer_indices,
             seed=args.seed,
-            device=device,
+            vae_device=vae_device,
+            dit_device=dit_device,
         )
 
     target_norm = target_acts.norm()
     loss_fn = lambda x, y: 1 - torch.dot(x.float(), y) / (x.float().norm() * target_norm)
 
     # ------------------------------------------------------------------
-    # 9. Run PGD
+    # 9. Run attack
     # ------------------------------------------------------------------
-    print(f"\nRunning PGD attack  (steps={args.steps}, alpha={args.alpha:.5f}, eps={args.eps:.4f})...")
-    x_adv = pgd(
-        raw_state,
-        target_acts,
-        encode_fn,
-        loss_fn,
-        steps=args.steps,
-        alpha=args.alpha,
-        eps=args.eps,
-        device=device,
-    )
+    if args.alternating:
+        print("\nRunning alternating attack...")
+        x_adv = alternating_attack(
+            x_orig                    = raw_state,
+            emb_target                = target_acts,
+            target_norm               = target_acts.norm(),
+            model                     = model,
+            condition_true            = condition_true,
+            frames_to_extract         = frames_to_extract,
+            required_pixel_frames     = required_pixel_frames,
+            num_latent_conditional_frames = args.num_latent_conditional_frames,
+            num_denoise_steps         = args.num_denoise_steps,
+            layer_indices             = layer_indices,
+            outer_steps               = args.outer_steps,
+            embed_steps               = args.embed_steps,
+            pixel_steps               = args.steps,
+            alpha                     = args.alpha,
+            eps                       = args.eps,
+            embed_alpha               = args.embed_alpha,
+            embed_eps                 = args.embed_eps,
+            seed                      = args.seed,
+            vae_device                = vae_device,
+            dit_device                = dit_device,
+            offload_net               = args.offload_net_between_phases,
+        )
+    else:
+        print(f"\nRunning PGD attack  (steps={args.steps}, alpha={args.alpha:.5f}, eps={args.eps:.4f})...")
+        x_adv = pgd(
+            raw_state,
+            target_acts,
+            encode_fn,
+            loss_fn,
+            steps=args.steps,
+            alpha=args.alpha,
+            eps=args.eps,
+            device=device,
+        )
 
     # ------------------------------------------------------------------
     # 10. Save outputs
@@ -478,6 +844,7 @@ if __name__ == "__main__":
 
 
 """
+# Standard end-to-end mode (high VRAM):
 python cosmos-predict2.5/scripts/attack_cross_attention_generative.py \
     --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \
     --true_prompt "Use the franka robot arm to pick up the black bowl next to the cookie box and place it on the plate" \
@@ -490,6 +857,27 @@ python cosmos-predict2.5/scripts/attack_cross_attention_generative.py \
     --num_denoise_steps 5 \
     --attack_layers 14 15 16 17 18 \
     --steps 20 --alpha 0.00392 --eps 0.0628 \
+    --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \
+    --offload_diffusion_model \
+    --offload_tokenizer \
+    --offload_text_encoder
+
+# Alternating mode (low VRAM):
+python cosmos-predict2.5/scripts/attack_cross_attention_generative.py \
+    --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \
+    --true_prompt "Use the franka robot arm to pick up the black bowl next to the cookie box and place it on the plate" \
+    --target_prompt "Use the franka robot arm to open the drawer and place the cookie box in it" \
+    --experiment_name predict2_video2world_training_2b_libero_480 \
+    --ckpt_path /home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/8fbc6188fa2f2e4ab585dc6aac3edd0e9d8a3670/model.pt \
+    --resolution 432,432 \
+    --num_latent_video_frames 6 \
+    --num_latent_conditional_frames 2 \
+    --num_denoise_steps 5 \
+    --attack_layers 14 15 16 17 18 \
+    --alternating \
+    --outer_steps 10 \
+    --embed_steps 5 --embed_alpha 0.05 --embed_eps 0.5 \
+    --steps 10 --alpha 0.00392 --eps 0.0628 \
     --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \
     --offload_diffusion_model \
     --offload_tokenizer \

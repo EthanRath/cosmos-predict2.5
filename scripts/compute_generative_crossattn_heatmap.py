@@ -32,19 +32,19 @@ Saved artefacts (attack/outputs/gen_crossattn_<timestamp>/):
   - prompt_diff.pt         : raw diff saliency tensor
 
 Usage:
-    python cosmos-predict2.5/scripts/compute_generative_crossattn_heatmap.py \\
-        --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \\
-        --experiment_name predict2_video2world_training_2b_libero_480 \\
-        --ckpt_path /path/to/model.pt \\
-        --prompt "Use the franka robot arm to pick up the black bowl" \\
-        --resolution 432,432 \\
-        --num_latent_conditional_frames 2 \\
-        --num_steps 35 \\
-        --guidance 7 \\
-        --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \\
-        [--compare_prompt "a cat sitting on a table"] \\
-        [--layers 14 15 16 17 18] \\
-        [--alpha_blend 0.5] \\
+    python cosmos-predict2.5/scripts/compute_generative_crossattn_heatmap.py \
+        --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \
+        --experiment_name predict2_video2world_training_2b_libero_480 \
+        --ckpt_path /path/to/model.pt \
+        --prompt "Use the franka robot arm to pick up the black bowl" \
+        --resolution 432,432 \
+        --num_latent_conditional_frames 2 \
+        --num_steps 35 \
+        --guidance 7 \
+        --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \
+        [--compare_prompt "a cat sitting on a table"] \
+        [--layers 14 15 16 17 18] \
+        [--alpha_blend 0.5] \
         [--offload_diffusion_model] [--offload_tokenizer] [--offload_text_encoder]
 """
 
@@ -654,27 +654,27 @@ if __name__ == "__main__":
 
 """
 # single prompt
-python cosmos-predict2.5/scripts/compute_generative_crossattn_heatmap.py \\
-    --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \\
-    --experiment_name predict2_video2world_training_2b_libero_480 \\
-    --ckpt_path /home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/8fbc6188fa2f2e4ab585dc6aac3edd0e9d8a3670/model.pt \\
-    --prompt "Use the franka robot arm to pick up the black bowl next to the cookie box and place it on the plate" \\
-    --resolution 432,432 \\
-    --num_latent_conditional_frames 2 \\
-    --num_steps 35 --guidance 7 --seed 1 \\
-    --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \\
+python cosmos-predict2.5/scripts/compute_generative_crossattn_heatmap.py \
+    --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \
+    --experiment_name predict2_video2world_training_2b_libero_480 \
+    --ckpt_path /home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/8fbc6188fa2f2e4ab585dc6aac3edd0e9d8a3670/model.pt \
+    --prompt "Use the franka robot arm to pick up the black bowl next to the cookie box and place it on the plate" \
+    --resolution 432,432 \
+    --num_latent_conditional_frames 2 \
+    --num_steps 35 --guidance 7 --seed 1 \
+    --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \
     --offload_diffusion_model --offload_tokenizer --offload_text_encoder
 
 # contrastive diff mode
-python cosmos-predict2.5/scripts/compute_generative_crossattn_heatmap.py \\
-    --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \\
-    --experiment_name predict2_video2world_training_2b_libero_480 \\
-    --ckpt_path /home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/8fbc6188fa2f2e4ab585dc6aac3edd0e9d8a3670/model.pt \\
-    --prompt "Use the franka robot arm to pick up the black bowl next to the cookie box and place it on the plate" \\
-    --compare_prompt "a cat sitting on a table in a kitchen" \\
-    --resolution 432,432 \\
-    --num_latent_conditional_frames 2 \\
-    --num_steps 35 --guidance 7 --seed 1 \\
-    --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \\
+python cosmos-predict2.5/scripts/compute_generative_crossattn_heatmap.py \
+    --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \
+    --experiment_name predict2_video2world_training_2b_libero_480 \
+    --ckpt_path /home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/a42439ce5f10e438aa8ba6d7fd1657a206e0d13f/model.pt \
+    --prompt "Use the franka robot arm to pick up the black bowl next to the cookie box and place it on the plate" \
+    --compare_prompt "Use the franka robot arm to pick up the cookie box and place it on the stove" \
+    --resolution 432,432 \
+    --num_latent_conditional_frames 2 \
+    --num_steps 35 --guidance 7 --seed 1 \
+    --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \
     --offload_diffusion_model --offload_tokenizer --offload_text_encoder
 """
