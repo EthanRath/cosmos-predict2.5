@@ -129,11 +129,11 @@ def get_crossattn_after_denoise(
     seed=42,
     vae_device="cuda",
     dit_device="cuda",
+    entropy_mode=False,
 ):
     """
     Encode `video` through the VAE, run `num_denoise_steps` Euler denoising
-    steps, and return the concatenated cross-attention outputs from the final
-    step.
+    steps, and return the cross-attention outputs from the final step.
 
     Parameters
     ----------
@@ -150,10 +150,13 @@ def get_crossattn_after_denoise(
                          When equal to vae_device this is single-GPU mode.
                          When different, latent.to(dit_device) forms a differentiable
                          cross-device bridge so gradients flow back through the VAE.
+    entropy_mode       : bool.  If True, return a list of per-layer (B, S, D) float32
+                         tensors instead of a single flat concatenated vector.
 
     Returns
     -------
-    flat (N,) float32 tensor with grad attached.
+    entropy_mode=False : flat (N,) float32 tensor with grad attached.
+    entropy_mode=True  : list of (B, S, D) float32 tensors, one per captured layer.
     """
     kw = {"device": dit_device, "dtype": torch.bfloat16}
 
@@ -251,6 +254,8 @@ def get_crossattn_after_denoise(
             "Check --attack_layers and that those blocks have a cross_attn attribute."
         )
 
+    if entropy_mode:
+        return [captured[k].float() for k in sorted(captured.keys())]
     return torch.cat([captured[k].flatten() for k in sorted(captured.keys())])
 
 
@@ -267,6 +272,7 @@ def get_crossattn_from_latent(
     layer_indices,
     seed=42,
     dit_device="cuda",
+    entropy_mode=False,
 ):
     """
     Like get_crossattn_after_denoise but receives an already-encoded VAE latent
@@ -275,8 +281,9 @@ def get_crossattn_from_latent(
 
     Parameters
     ----------
-    latent     : (B, C, T_lat, H_lat, W_lat) float32, may have requires_grad=True.
-    dit_device : str.  Device the DiT runs on.  Latent is moved here if needed.
+    latent       : (B, C, T_lat, H_lat, W_lat) float32, may have requires_grad=True.
+    dit_device   : str.  Device the DiT runs on.  Latent is moved here if needed.
+    entropy_mode : bool.  If True, return a list of per-layer (B, S, D) tensors.
     All other parameters identical to get_crossattn_after_denoise.
     """
     kw = {"device": dit_device, "dtype": torch.bfloat16}
@@ -358,6 +365,8 @@ def get_crossattn_from_latent(
     if not captured:
         raise RuntimeError("No cross-attn outputs captured from get_crossattn_from_latent.")
 
+    if entropy_mode:
+        return [captured[k].float() for k in sorted(captured.keys())]
     return torch.cat([captured[k].flatten() for k in sorted(captured.keys())])
 
 
@@ -424,6 +433,7 @@ def alternating_attack(
     vae_device="cuda",
     dit_device="cuda",
     offload_net=False,
+    loss_fn=None,
 ):
     """
     Two-phase alternating attack (low VRAM):
@@ -450,8 +460,12 @@ def alternating_attack(
         before Phase 1, freeing ~4 GB (2B params @ bfloat16).
     """
     x_adv = x_orig.clone().detach()
+    entropy_mode = loss_fn is not None
 
-    crossattn_loss_fn = lambda x, y: 1.0 - torch.dot(x.float(), y) / (x.float().norm() * target_norm)
+    if entropy_mode:
+        crossattn_loss_fn = loss_fn
+    else:
+        crossattn_loss_fn = lambda x, y: 1.0 - torch.dot(x.float(), y) / (x.float().norm() * target_norm)
 
     for outer in range(outer_steps):
         print(f"\nOuter iteration {outer + 1}/{outer_steps}")
@@ -473,6 +487,7 @@ def alternating_attack(
         embed_fn = lambda z: get_crossattn_from_latent(
             model, z, condition_true, condition_true,
             num_denoise_steps, layer_indices, seed, dit_device,
+            entropy_mode=entropy_mode,
         )
         z_star = pgd_latent(
             z_adv, emb_target, embed_fn, crossattn_loss_fn,
@@ -527,8 +542,10 @@ def main():
                         help="Path to source input .mp4")
     parser.add_argument("--true_prompt",      required=True,
                         help="Prompt used at inference time (what the model receives)")
-    parser.add_argument("--target_prompt",    required=True,
-                        help="Prompt whose cross-attention activations we optimise toward")
+    parser.add_argument("--target_prompt",    default=None,
+                        help="Prompt whose cross-attention activations we optimise toward. "
+                             "If omitted, switches to entropy mode: minimises cross-attention "
+                             "magnitude (sum of per-layer MSE to zero) with no target prompt.")
     parser.add_argument("--experiment_name",  required=True)
     parser.add_argument("--ckpt_path",        required=True)
     parser.add_argument("--resolution",       default="432,432")
@@ -590,6 +607,8 @@ def main():
     )
     args = parser.parse_args()
 
+    entropy_mode = args.target_prompt is None
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if args.split_gpus:
         assert torch.cuda.device_count() >= 2, "split_gpus requires at least 2 CUDA devices"
@@ -609,6 +628,7 @@ def main():
     print(f"Denoising steps     : {args.num_denoise_steps}  (capture at t ≈ {eff_t:.3f})")
     print(f"Attack layers       : {args.attack_layers or 'all'}")
     print(f"PGD eps             : {args.eps:.4f}")
+    print(f"Loss mode           : {'ENTROPY (minimise cross-attn magnitude)' if entropy_mode else f'COSINE  (target: {args.target_prompt})'}")
     if args.alternating:
         print(f"Mode                : ALTERNATING  "
               f"(outer={args.outer_steps}, embed={args.embed_steps}×α={args.embed_alpha}/ε={args.embed_eps}, "
@@ -657,14 +677,15 @@ def main():
     data_batch_true["video"]             = video_bf16
     data_batch_true[IS_PREPROCESSED_KEY] = True
 
-    print("Computing T5 embeddings for target prompt...")
-    data_batch_target = inference._get_data_batch_input(
-        video=video_bf16, prompt=args.target_prompt,
-        num_conditional_frames=args.num_latent_conditional_frames,
-        negative_prompt=_DEFAULT_NEGATIVE_PROMPT, use_neg_prompt=True,
-    )
-    data_batch_target["video"]             = video_bf16
-    data_batch_target[IS_PREPROCESSED_KEY] = True
+    if not entropy_mode:
+        print("Computing T5 embeddings for target prompt...")
+        data_batch_target = inference._get_data_batch_input(
+            video=video_bf16, prompt=args.target_prompt,
+            num_conditional_frames=args.num_latent_conditional_frames,
+            negative_prompt=_DEFAULT_NEGATIVE_PROMPT, use_neg_prompt=True,
+        )
+        data_batch_target["video"]             = video_bf16
+        data_batch_target[IS_PREPROCESSED_KEY] = True
 
     # ------------------------------------------------------------------
     # 4. Offloading (mirrors generate_vid2world)
@@ -710,21 +731,24 @@ def main():
     # ------------------------------------------------------------------
     print("\nBuilding condition objects...")
     with torch.no_grad():
-        _, _, condition_true   = model.get_data_and_condition(data_batch_true)
-        _, _, condition_target = model.get_data_and_condition(data_batch_target)
+        _, _, condition_true = model.get_data_and_condition(data_batch_true)
+        if not entropy_mode:
+            _, _, condition_target = model.get_data_and_condition(data_batch_target)
 
     condition_true = condition_true.edit_for_inference(
         is_cfg_conditional=True,
         num_conditional_frames=args.num_latent_conditional_frames,
     )
-    condition_target = condition_target.edit_for_inference(
-        is_cfg_conditional=True,
-        num_conditional_frames=args.num_latent_conditional_frames,
-    )
+    if not entropy_mode:
+        condition_target = condition_target.edit_for_inference(
+            is_cfg_conditional=True,
+            num_conditional_frames=args.num_latent_conditional_frames,
+        )
 
     # Move condition tensors to the DiT device (T5 embeddings, masks, etc.)
-    move_condition_to_device(condition_true,   dit_device)
-    move_condition_to_device(condition_target, dit_device)
+    move_condition_to_device(condition_true, dit_device)
+    if not entropy_mode:
+        move_condition_to_device(condition_target, dit_device)
 
     model.tokenizer.enable_grad = True   # allow gradient through VAE encoder
 
@@ -738,25 +762,37 @@ def main():
 
     # ------------------------------------------------------------------
     # 7. Compute fixed target activations: crossattn(orig_video, target_prompt)
+    #    Skipped in entropy mode — no target prompt exists.
     # ------------------------------------------------------------------
-    print("\nComputing fixed target cross-attention activations...")
     video_padded = pad_video(raw_state, frames_to_extract, required_pixel_frames)
-    with torch.no_grad():
-        target_acts = get_crossattn_after_denoise(
-            model, video_padded,
-            condition_denoise=condition_true,
-            condition_attn=condition_target,
-            num_denoise_steps=args.num_denoise_steps,
-            layer_indices=layer_indices,
-            seed=args.seed,
-            vae_device=vae_device,
-            dit_device=dit_device,
-        ).detach().float()
-    print(f"Target activations shape : {target_acts.shape}")
+    if entropy_mode:
+        target_acts = None
+        print("\nEntropy mode: skipping target activation computation.")
+    else:
+        print("\nComputing fixed target cross-attention activations...")
+        with torch.no_grad():
+            target_acts = get_crossattn_after_denoise(
+                model, video_padded,
+                condition_denoise=condition_true,
+                condition_attn=condition_target,
+                num_denoise_steps=args.num_denoise_steps,
+                layer_indices=layer_indices,
+                seed=args.seed,
+                vae_device=vae_device,
+                dit_device=dit_device,
+            ).detach().float()
+        print(f"Target activations shape : {target_acts.shape}")
 
     # ------------------------------------------------------------------
-    # 8. Define encode_fn and loss for PGD
-    #    encode_fn(x_adv) -> crossattn(VAE(pad(x_adv)), true_prompt)
+    # 8. Define encode_fn and loss for PGD.
+    #
+    #    Cosine mode  (target_prompt given):
+    #      encode_fn -> flat (N,) vector; loss = 1 - cosine_sim(pred, target)
+    #
+    #    Entropy mode (no target_prompt):
+    #      encode_fn -> list of per-layer (B, S, D) tensors
+    #      loss      = sum_layers( MSE(layer_output, 0) )
+    #                = sum_layers( layer_output.pow(2).mean() )
     # ------------------------------------------------------------------
     def encode_fn(x):
         x_padded = pad_video(x, frames_to_extract, required_pixel_frames)
@@ -769,10 +805,14 @@ def main():
             seed=args.seed,
             vae_device=vae_device,
             dit_device=dit_device,
+            entropy_mode=entropy_mode,
         )
 
-    target_norm = target_acts.norm()
-    loss_fn = lambda x, y: 1 - torch.dot(x.float(), y) / (x.float().norm() * target_norm)
+    if entropy_mode:
+        loss_fn = lambda outputs, _: sum(t.pow(2).mean() for t in outputs)
+    else:
+        target_norm = target_acts.norm()
+        loss_fn = lambda x, y: 1 - torch.dot(x.float(), y) / (x.float().norm() * target_norm)
 
     # ------------------------------------------------------------------
     # 9. Run attack
@@ -782,7 +822,7 @@ def main():
         x_adv = alternating_attack(
             x_orig                    = raw_state,
             emb_target                = target_acts,
-            target_norm               = target_acts.norm(),
+            target_norm               = target_acts.norm() if target_acts is not None else None,
             model                     = model,
             condition_true            = condition_true,
             frames_to_extract         = frames_to_extract,
@@ -801,12 +841,13 @@ def main():
             vae_device                = vae_device,
             dit_device                = dit_device,
             offload_net               = args.offload_net_between_phases,
+            loss_fn                   = loss_fn if entropy_mode else None,
         )
     else:
         print(f"\nRunning PGD attack  (steps={args.steps}, alpha={args.alpha:.5f}, eps={args.eps:.4f})...")
         x_adv = pgd(
             raw_state,
-            target_acts,
+            target_acts,  # None in entropy mode; ignored by loss_fn
             encode_fn,
             loss_fn,
             steps=args.steps,
