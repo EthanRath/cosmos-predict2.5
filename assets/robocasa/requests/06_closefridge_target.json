@@ -1,0 +1,6 @@
+{
+  "name": "06_closefridge_target",
+  "inference_type": "image2world",
+  "prompt": "A RoboCasa kitchen simulation from the left third-person camera. Task: Close the fridge doors.",
+  "input_path": "/work/nvme/bgse/smahmud2/RCWM/example/frames/06_closefridge_target.jpg"
+}

@@ -1,0 +1,6 @@
+{
+  "name": "04_opendrawer_target_robot0_agentview_left",
+  "inference_type": "image2world",
+  "prompt": "A RoboCasa kitchen simulation from the left third-person camera. Task: Open the right drawer.",
+  "input_path": "/work/nvme/bgse/smahmud2/RCWM/example/frames/04_opendrawer_target_robot0_agentview_left.jpg"
+}

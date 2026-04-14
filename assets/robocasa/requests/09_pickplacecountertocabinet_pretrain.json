@@ -1,0 +1,6 @@
+{
+  "name": "09_pickplacecountertocabinet_pretrain",
+  "inference_type": "image2world",
+  "prompt": "A RoboCasa kitchen simulation from the left third-person camera. Task: Pick the cereal from the counter and place it in the cabinet.",
+  "input_path": "/work/nvme/bgse/smahmud2/RCWM/example/frames/09_pickplacecountertocabinet_pretrain.jpg"
+}

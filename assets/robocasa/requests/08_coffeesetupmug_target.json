@@ -1,0 +1,6 @@
+{
+  "name": "08_coffeesetupmug_target-ft",
+  "inference_type": "image2world",
+  "prompt": "A RoboCasa kitchen simulation from the left third-person camera. Task: Pick the mug from the counter and place it under the coffee machine dispenser.",
+  "input_path": "08_coffeesetupmug_target.jpg"
+}

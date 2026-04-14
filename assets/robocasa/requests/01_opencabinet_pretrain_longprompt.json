@@ -1,0 +1,9 @@
+{
+  "name": "01_opencabinet_pretrain_longprompt",
+  "inference_type": "image2world",
+  "prompt": "A fixed left third-person camera observes a RoboCasa kitchen simulation. The robot performs the task: Open the cabinet doors. Visible fixtures and objects include Wall, Floor, WallAccessory, door_obj, distr_counter_1, distr_counter_2. The robot moves smoothly and physically plausibly while interacting with the relevant household objects, and the background remains stable throughout the clip.",
+  "input_path": "/work/nvme/bgse/smahmud2/RCWM/example/frames/01_opencabinet_pretrain.jpg",
+  "guidance": 3,
+  "num_steps": 35,
+  "num_output_frames": 77
+}

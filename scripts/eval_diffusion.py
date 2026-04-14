@@ -41,6 +41,7 @@ REPO_ROOT  = SCRIPT_DIR.parent      # cosmos-predict2.5/
 WM_ROOT    = REPO_ROOT.parent       # WM_Poison/
 
 sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(SCRIPT_DIR))
 
 # ---------------------------------------------------------------------------
 # Imports (deferred so sys.path is set first)
@@ -86,17 +87,28 @@ def main():
     is_rank0   = local_rank == 0
 
     # ------------------------------------------------------------------
-    # 1. Load adversarial tensor
+    # 1. Load adversarial tensor  (.pt) or video (.mp4)
     # ------------------------------------------------------------------
     if is_rank0:
         print(f"Loading adversarial tensor from: {args.adv_path}")
-    x_adv = torch.load(args.adv_path, map_location="cpu")
-    assert x_adv.ndim == 5 and x_adv.shape[1] == 3, (
-        f"Expected shape (1,3,T,H,W), got {x_adv.shape}"
-    )
-    assert x_adv.dtype == torch.float32, (
-        f"Expected float32 tensor, got {x_adv.dtype}"
-    )
+    if args.adv_path.endswith(".mp4"):
+        from test_vae_encoder import load_and_preprocess_video, normalize_video  # noqa: E402
+        H, W = [int(x) for x in args.resolution.split(",")]
+        frames_to_load = 4 * (args.num_latent_conditional_frames - 1) + 1
+        video_uint8 = load_and_preprocess_video(
+            video_path=args.adv_path,
+            resolution=[H, W],
+            num_video_frames=frames_to_load,
+        )
+        x_adv = normalize_video(video_uint8, device="cpu")
+    else:
+        x_adv = torch.load(args.adv_path, map_location="cpu")
+        assert x_adv.ndim == 5 and x_adv.shape[1] == 3, (
+            f"Expected shape (1,3,T,H,W), got {x_adv.shape}"
+        )
+        assert x_adv.dtype == torch.float32, (
+            f"Expected float32 tensor, got {x_adv.dtype}"
+        )
     print(f"x_adv shape : {x_adv.shape}, range [{x_adv.min():.3f}, {x_adv.max():.3f}]")
 
     # ------------------------------------------------------------------

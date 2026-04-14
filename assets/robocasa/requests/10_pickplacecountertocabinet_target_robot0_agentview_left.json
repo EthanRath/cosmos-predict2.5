@@ -1,0 +1,6 @@
+{
+  "name": "10_pickplacecountertocabinet_target_robot0_agentview_left",
+  "inference_type": "image2world",
+  "prompt": "A RoboCasa kitchen simulation from the left third-person camera. Task: Pick the honey bottle from the counter and place it in the cabinet.",
+  "input_path": "/work/nvme/bgse/smahmud2/RCWM/example/frames/10_pickplacecountertocabinet_target_robot0_agentview_left.jpg"
+}
