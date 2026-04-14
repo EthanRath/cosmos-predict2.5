@@ -3,48 +3,52 @@ Probe the structural properties of self-attention in the Cosmos Video2World DiT.
 
 Captures Q and K tensors from selected DiT blocks by temporarily wrapping
 block.self_attn.compute_attention (instance-level monkey-patch, no source
-modification needed).  For each probed block, the script reports:
+modification needed).  For each probed block the script reports:
 
   1. Q / K / output tensor shapes and dtypes
   2. Per-temporal-frame Q-norm and K-norm (mean over heads + spatial tokens)
   3. T_tok × T_tok frame-to-frame attention score matrix:
        frame_attn[qi, kj]  = softmax_kj( mean_head( Q̄[qi] · K̄[kj] / √D ) )
      where Q̄[qi] is the spatial-mean Q vector for token-frame qi.
-     This is an approximation of the true frame-level aggregate
-     (which would require materialising the full S×S matrix), but it directly
-     reveals the temporal structure: which source frames each query frame attends
-     to most strongly.
-  4. Per-frame output L2-norm (from the output hook on block.self_attn)
+     This approximates the true frame-level aggregate without materialising
+     the full S×S attention matrix.
+  4. Per-frame output L2-norm
 
-After all blocks, a summary frame-to-frame matrix averaged across all probed
+After all blocks a summary frame-to-frame matrix averaged across all probed
 blocks is printed, along with four aggregate attention-flow numbers:
   COND→COND, GEN→COND, COND→GEN, GEN→GEN.
+
+Memory design
+-------------
+Per-frame statistics (frame_attn, q_norm, k_norm, out_norm) are computed
+inline as each block fires, so peak CPU RAM is bounded to one block's Q/K
+tensors at a time (~140 MB for the 2B model) regardless of how many blocks
+are probed.  Raw Q/K tensors are discarded immediately unless --save_qk is
+set (adds ~136 MB × n_probed_blocks to peak CPU RAM).
 
 No video rendering is performed.
 
 Saved artefacts (attack/outputs/selfattn_structure_<timestamp>/):
-  selfattn_structure.pt  — dict with:
+  selfattn_structure.pt — dict with:
       token_grid      : {"T_tok", "H_tok", "W_tok"}
       num_cond_tok    : int
       latent_shape    : (B, C, T, H, W)
-      mean_frame_attn : (T_tok, T_tok) float32  — average across probed blocks
+      probed_blocks   : list[int]
+      mean_frame_attn : (T_tok, T_tok) float32
       blocks          : {block_idx: {"frame_attn": (T,T), "q_norm": (T,),
-                                     "k_norm": (T,), "out_norm": (T,)}}
-      [--save_qk only]
-      blocks[idx]["q"] : (B, S, H, D) float32
-      blocks[idx]["k"] : (B, S, H, D) float32
+                                     "k_norm": (T,), "out_norm": (T,),
+                                     ["q": (B,S,H,D), "k": (B,S,H,D)]}}
 
 Usage:
-    python cosmos-predict2.5/scripts/probe_selfattn_structure.py \\
-        --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \\
-        --experiment_name predict2_video2world_training_2b_libero_480 \\
-        --ckpt_path /path/to/model.pt \\
-        --prompt "Use the franka robot arm to pick up the black bowl" \\
-        --resolution 432,432 \\
-        --num_latent_conditional_frames 2 \\
-        --timestep 0.0 \\
-        --layers 0 5 10 15 20 25 \\
-        --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \\
+    python cosmos-predict2.5/scripts/probe_selfattn_structure.py \
+        --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \
+        --experiment_name predict2_video2world_training_2b_libero_480 \
+        --ckpt_path /path/to/model.pt \
+        --prompt "Use the franka robot arm to pick up the black bowl" \
+        --resolution 432,432 \
+        --num_latent_conditional_frames 2 \
+        --timestep 0.0 \
+        --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \
         --offload_diffusion_model --offload_tokenizer --offload_text_encoder
 """
 
@@ -80,96 +84,7 @@ from test_vae_encoder import load_and_preprocess_video, normalize_video  # noqa:
 
 
 # ---------------------------------------------------------------------------
-# Q / K capture via instance-level compute_attention wrap
-# ---------------------------------------------------------------------------
-
-def wrap_selfattn_qk(net, layer_indices=None):
-    """
-    Temporarily replace block.self_attn.compute_attention on each selected
-    block with a closure that records (q, k) before delegating to the original.
-
-    Works by writing to the instance __dict__, so:
-      • The class method is untouched.
-      • 'self' is NOT auto-prepended when the instance attr is called
-        (non-data descriptor rule), so the wrapper signature (q, k, v, **kw)
-        matches the real call site.
-      • orig_fn is a bound method, so orig_fn(q, k, v, **kw) works correctly.
-
-    Returns
-    -------
-    captured_qk : dict {block_idx -> (q, k)}
-                  q, k : (B, S, H, D) float32 cpu tensors
-                  Populated after a forward pass.
-    restore     : callable — removes all patches.
-    """
-    n_blocks = len(net.blocks)
-    indices  = layer_indices if layer_indices is not None else list(range(n_blocks))
-
-    captured_qk = {}
-    _patches    = {}   # {idx: (attn_module, original_bound_method)}
-
-    for idx in indices:
-        if idx >= n_blocks:
-            continue
-        block = net.blocks[idx]
-        if not hasattr(block, "self_attn"):
-            continue
-
-        attn    = block.self_attn
-        orig_fn = attn.compute_attention  # bound method (has self baked in)
-
-        def _make_wrapper(i, fn):
-            def _wrapper(q, k, v, **kw):
-                captured_qk[i] = (
-                    q.detach().cpu().float(),
-                    k.detach().cpu().float(),
-                )
-                return fn(q, k, v, **kw)
-            return _wrapper
-
-        # Write to instance dict — shadows the class method for this instance only
-        attn.__dict__["compute_attention"] = _make_wrapper(idx, orig_fn)
-        _patches[idx] = (attn, orig_fn)
-
-    def _restore():
-        for _idx, (attn_mod, _orig) in _patches.items():
-            attn_mod.__dict__.pop("compute_attention", None)
-
-    return captured_qk, _restore
-
-
-# ---------------------------------------------------------------------------
-# Self-attn output hook (same approach as compute_selfattn_heatmap.py)
-# ---------------------------------------------------------------------------
-
-def register_selfattn_output_hooks(net, layer_indices=None):
-    """Register forward hooks on block.self_attn to capture the output tensor."""
-    n_blocks     = len(net.blocks)
-    indices      = layer_indices if layer_indices is not None else list(range(n_blocks))
-    hooks        = []
-    captured_out = {}
-
-    for idx in indices:
-        if idx >= n_blocks:
-            continue
-        block = net.blocks[idx]
-        if not hasattr(block, "self_attn"):
-            continue
-
-        def _make_hook(i):
-            def _hook(_m, _inp, output):
-                out = output[0] if isinstance(output, tuple) else output
-                captured_out[i] = out.detach().cpu().float()   # (B, S, D)
-            return _hook
-
-        h = block.self_attn.register_forward_hook(_make_hook(idx))
-        hooks.append(h)
-
-    return hooks, captured_out
-
-
-# ---------------------------------------------------------------------------
-# Token-grid detection (shared with other scripts in this directory)
+# Token-grid detection
 # ---------------------------------------------------------------------------
 
 def detect_token_dims(S, T_lat, H_lat, W_lat):
@@ -204,32 +119,124 @@ def compute_frame_attn(q, k, T_tok):
     """
     Compute a (B, T_tok, T_tok) frame-to-frame attention score matrix.
 
-    q, k : (B, S, H, D) float32  where S = T_tok * H_tok * W_tok
+    q, k : (B, S, H, D) float32  where S = T_tok * S_per_frame
 
-    Method
-    ------
-    Reshape Q and K to (B, T_tok, S_frame, H, D), average over spatial tokens
-    within each frame to get frame-level centroids (B, T_tok, H, D), compute
-    the scaled dot-product (T_tok, T_tok) matrix, head-average, then softmax
-    over key frames.
-
-    This approximates the true frame-level aggregate (mean over all token pairs
-    per frame pair) without materialising the full S×S attention matrix.
+    Spatial tokens within each frame are averaged to get frame-level Q/K
+    centroids (B, T_tok, H, D).  The (T_tok, T_tok) scaled dot-product matrix
+    is head-averaged then softmaxed over key frames.
 
     frame_attn[b, qi, kj] ≈ softmax_{kj}( mean_h( Q̄_h[qi] · K̄_h[kj] / √D ) )
+
+    This avoids materialising the full (S × S) attention matrix.
     """
     B, S, H, D = q.shape
     S_per_frame = S // T_tok
     scale       = D ** -0.5
 
-    # Mean Q and K per temporal-frame: (B, T_tok, H, D)
-    q_frame = q.view(B, T_tok, S_per_frame, H, D).mean(dim=2)
+    q_frame = q.view(B, T_tok, S_per_frame, H, D).mean(dim=2)  # (B, T, H, D)
     k_frame = k.view(B, T_tok, S_per_frame, H, D).mean(dim=2)
 
-    # (B, T_qi, T_kj, H) → average over heads → (B, T_qi, T_kj)
-    scores = torch.einsum("bihd,bjhd->bijh", q_frame, k_frame) * scale
-    scores = scores.mean(dim=-1)            # (B, T_tok, T_tok)
-    return torch.softmax(scores, dim=-1)    # softmax over key frames
+    scores = torch.einsum("bihd,bjhd->bijh", q_frame, k_frame) * scale  # (B, T, T, H)
+    return torch.softmax(scores.mean(dim=-1), dim=-1)   # (B, T_tok, T_tok)
+
+
+# ---------------------------------------------------------------------------
+# Streaming probes — compute stats inline, discard raw Q/K immediately
+# ---------------------------------------------------------------------------
+
+def install_selfattn_probes(net, T_tok, layer_indices=None, save_qk=False):
+    """
+    Install Q/K wrappers and output hooks on selected DiT blocks.
+
+    Both wrappers and hooks write into the same `captured` dict keyed by
+    block index.  Statistics are computed inline as each block fires so
+    that peak CPU RAM is bounded to one block's tensors at a time.
+
+    Returns
+    -------
+    captured : dict {block_idx -> stats_entry}  — populated during a forward pass
+               stats_entry keys: frame_attn (T,T), q_norm (T,), k_norm (T,),
+               out_norm (T,) [added by output hook], plus q/k if save_qk.
+    restore  : callable — removes all patches and hooks.
+    """
+    n_blocks = len(net.blocks)
+    indices  = layer_indices if layer_indices is not None else list(range(n_blocks))
+
+    captured  = {}
+    _patches  = {}   # {idx: (attn_mod, orig_bound_method)}
+    _hooks    = []
+
+    for idx in indices:
+        if idx >= n_blocks:
+            continue
+        block = net.blocks[idx]
+        if not hasattr(block, "self_attn"):
+            continue
+
+        attn    = block.self_attn
+        orig_fn = attn.compute_attention  # bound method
+
+        # ── Q/K wrapper ─────────────────────────────────────────────────────
+        # Written into instance __dict__ so Python returns it directly (no
+        # auto-binding), giving signature (q, k, v, **kw) at the call site.
+        def _make_qk_wrapper(i, fn):
+            def _wrapper(q, k, v, **kw):
+                q_cpu = q.detach().cpu().float()   # move to CPU while still hot
+                k_cpu = k.detach().cpu().float()
+
+                B_loc, S, H, D = q_cpu.shape
+                S_per_frame = S // T_tok
+
+                # Per-frame Q/K norms  (discard spatial/head detail immediately)
+                q_f    = q_cpu.view(B_loc, T_tok, S_per_frame, H, D)
+                k_f    = k_cpu.view(B_loc, T_tok, S_per_frame, H, D)
+                q_norm = q_f.norm(dim=-1).mean(dim=(-1, -2))[0]   # (T_tok,)
+                k_norm = k_f.norm(dim=-1).mean(dim=(-1, -2))[0]
+
+                # Frame-to-frame attention matrix
+                frame_attn = compute_frame_attn(q_cpu[:1], k_cpu[:1], T_tok)[0]
+
+                entry = {
+                    "frame_attn": frame_attn,
+                    "q_norm":     q_norm,
+                    "k_norm":     k_norm,
+                    "shape_q":    tuple(q_cpu.shape),
+                }
+                if save_qk:
+                    entry["q"] = q_cpu
+                    entry["k"] = k_cpu
+                # q_cpu / k_cpu go out of scope here if not saved → freed
+                captured[i] = entry
+
+                return fn(q, k, v, **kw)
+            return _wrapper
+
+        attn.__dict__["compute_attention"] = _make_qk_wrapper(idx, orig_fn)
+        _patches[idx] = (attn, orig_fn)
+
+        # ── Output hook ─────────────────────────────────────────────────────
+        def _make_out_hook(i):
+            def _hook(_m, _inp, output):
+                out = (output[0] if isinstance(output, tuple) else output
+                       ).detach().cpu().float()   # (B, S, D)
+                B_loc, S, D = out.shape
+                out_f    = out.view(B_loc, T_tok, S // T_tok, D)
+                out_norm = out_f.norm(dim=-1).mean(dim=-1)[0]  # (T_tok,)
+                if i in captured:
+                    captured[i]["out_norm"] = out_norm
+                else:
+                    captured[i] = {"out_norm": out_norm}
+            return _hook
+
+        _hooks.append(attn.register_forward_hook(_make_out_hook(idx)))
+
+    def _restore():
+        for _idx, (attn_mod, _orig) in _patches.items():
+            attn_mod.__dict__.pop("compute_attention", None)
+        for h in _hooks:
+            h.remove()
+
+    return captured, _restore
 
 
 # ---------------------------------------------------------------------------
@@ -237,10 +244,7 @@ def compute_frame_attn(q, k, T_tok):
 # ---------------------------------------------------------------------------
 
 def print_frame_attn(frame_attn, num_cond_tok, prefix=""):
-    """
-    Print a (T_tok, T_tok) float tensor as a labelled matrix.
-    C = conditioning frame, G = generation frame.
-    """
+    """Print a (T_tok, T_tok) float tensor as a labelled matrix."""
     T = frame_attn.shape[0]
     col_labels = [f"k{j}({'C' if j < num_cond_tok else 'G'})" for j in range(T)]
     header = prefix + f"{'':>7}  " + "  ".join(f"{lbl:>7}" for lbl in col_labels)
@@ -279,10 +283,9 @@ def main():
     parser.add_argument("--timestep",         type=float, default=0.0,
                         help="Noise level: 0=clean latent, 1=pure noise (default: 0.0)")
     parser.add_argument("--layers",           type=int, nargs="*", default=None,
-                        help="DiT block indices to probe. "
-                             "Default: 5 evenly-spaced blocks across all layers.")
+                        help="DiT block indices to probe. Default: all blocks.")
     parser.add_argument("--save_qk",          action="store_true",
-                        help="Also save raw Q and K tensors (can be several hundred MB).")
+                        help="Also save raw Q and K tensors (~136 MB × n_blocks).")
     parser.add_argument("--offload_diffusion_model", action="store_true")
     parser.add_argument("--offload_text_encoder",    action="store_true")
     parser.add_argument("--offload_tokenizer",       action="store_true")
@@ -313,17 +316,10 @@ def main():
     n_blocks = len(model.net.blocks)
     required_pixel_frames = (state_t - 1) * 4 + 1
 
-    # Default: 5 evenly-spaced blocks
-    if args.layers:
-        layer_indices = args.layers
-    else:
-        step = max(1, n_blocks // 5)
-        layer_indices = list(range(0, n_blocks, step))[:5]
-        layer_indices[-1] = n_blocks - 1  # always include last
-
+    layer_indices = args.layers  # None → all blocks
     print(f"Model         : {n_blocks} DiT blocks, state_t={state_t}")
     print(f"Pixel frames  : {required_pixel_frames}")
-    print(f"Probing blocks: {layer_indices}")
+    print(f"Probing blocks: {layer_indices if layer_indices else 'all'}")
 
     # ------------------------------------------------------------------
     # 2. Load video
@@ -334,7 +330,7 @@ def main():
         resolution=[H, W],
         num_video_frames=required_pixel_frames,
     )
-    print(f"Video shape   : {video_uint8.shape}")  # (1, C, T_px, H, W)
+    print(f"Video shape   : {video_uint8.shape}")
 
     # ------------------------------------------------------------------
     # 3. Build data batch
@@ -384,11 +380,24 @@ def main():
 
     B, C_lat, T_lat, H_lat, W_lat = latent_state.shape
     print(f"Latent shape  : {tuple(latent_state.shape)}")
-    print(f"Latent grid   : T={T_lat}, H={H_lat}, W={W_lat}  "
-          f"(tokens per frame = {H_lat*W_lat}, total = {T_lat*H_lat*W_lat})")
 
     # ------------------------------------------------------------------
-    # 6. Build noisy latent at the requested timestep
+    # 6. Detect token grid from latent dims (no extra pass needed)
+    #    The DiT receives the latent directly with no additional temporal
+    #    patchification, so T_tok == T_lat in the typical case.
+    # ------------------------------------------------------------------
+    T_tok, H_tok, W_tok = detect_token_dims(
+        T_lat * H_lat * W_lat, T_lat, H_lat, W_lat
+    )
+    num_cond_tok = args.num_latent_conditional_frames
+
+    print(f"Token grid    : T={T_tok}  H={H_tok}  W={W_tok}  "
+          f"(S={T_tok*H_tok*W_tok}, {H_tok*W_tok} per frame)")
+    print(f"Frames        : {num_cond_tok} conditioning (0..{num_cond_tok-1})  "
+          f"+ {T_tok-num_cond_tok} generation ({num_cond_tok}..{T_tok-1})")
+
+    # ------------------------------------------------------------------
+    # 7. Build noisy latent at the requested timestep
     # ------------------------------------------------------------------
     t     = args.timestep
     noise = torch.randn_like(latent_state)
@@ -404,14 +413,17 @@ def main():
     )
 
     # ------------------------------------------------------------------
-    # 7. Install probes
+    # 8. Install streaming probes (stats computed inline → bounded RAM)
     # ------------------------------------------------------------------
-    print(f"\nInstalling Q/K capture wrappers on blocks {layer_indices}...")
-    captured_qk,  restore_qk  = wrap_selfattn_qk(model.net, layer_indices)
-    hooks_out,    captured_out = register_selfattn_output_hooks(model.net, layer_indices)
+    print(f"\nInstalling self-attention probes...")
+    captured, restore = install_selfattn_probes(
+        model.net, T_tok,
+        layer_indices=layer_indices,
+        save_qk=args.save_qk,
+    )
 
     # ------------------------------------------------------------------
-    # 8. Single forward pass
+    # 9. Single forward pass
     # ------------------------------------------------------------------
     print(f"Running DiT forward pass at t={t}...")
     with torch.no_grad():
@@ -420,102 +432,62 @@ def main():
             timesteps_B_T=timesteps,
             **condition.to_dict(),
         )
-
-    restore_qk()
-    for h in hooks_out:
-        h.remove()
-
-    print(f"Captured Q/K  : {len(captured_qk)} blocks")
-    print(f"Captured out  : {len(captured_out)} blocks")
+    restore()
+    print(f"Captured stats from {len(captured)} blocks")
 
     # ------------------------------------------------------------------
-    # 9. Detect token grid from output sequence length
+    # 10. Print per-block structural analysis
     # ------------------------------------------------------------------
-    sample_S = next(iter(captured_out.values())).shape[1]  # S = T_tok*H_tok*W_tok
-    T_tok, H_tok, W_tok = detect_token_dims(sample_S, T_lat, H_lat, W_lat)
-    num_cond_tok = args.num_latent_conditional_frames
-
     print(f"\n{'='*72}")
     print(f"  TOKEN GRID   : T_tok={T_tok}  H_tok={H_tok}  W_tok={W_tok}")
     print(f"  Sequence len : {T_tok*H_tok*W_tok}  ({H_tok*W_tok} tokens/frame)")
-    print(f"  Frames       : {num_cond_tok} conditioning (0..{num_cond_tok-1})  "
-          f"+ {T_tok-num_cond_tok} generation ({num_cond_tok}..{T_tok-1})")
+    print(f"  Frames       : {num_cond_tok} conditioning  "
+          f"+ {T_tok-num_cond_tok} generation")
     print(f"{'='*72}")
 
-    # ------------------------------------------------------------------
-    # 10. Per-block structural analysis
-    # ------------------------------------------------------------------
-    blocks_save = {}
     all_frame_attns = []
 
-    for blk_idx in sorted(captured_qk.keys()):
-        q, k = captured_qk[blk_idx]   # (B, S, H, D) float32 cpu
-        out  = captured_out.get(blk_idx)  # (B, S, D) float32 cpu
-
-        B_loc, S, n_heads, d_head = q.shape
-        S_per_frame = S // T_tok
+    for blk_idx in sorted(captured.keys()):
+        entry      = captured[blk_idx]
+        frame_attn = entry["frame_attn"]   # (T_tok, T_tok)
+        q_norm     = entry["q_norm"]       # (T_tok,)
+        k_norm     = entry["k_norm"]       # (T_tok,)
+        out_norm   = entry.get("out_norm") # (T_tok,) or None
+        shape_q    = entry.get("shape_q")
 
         print(f"\n{'─'*72}")
         print(f"  BLOCK {blk_idx}")
         print(f"{'─'*72}")
-        print(f"  Q  : {tuple(q.shape)}  dtype={q.dtype}")
-        print(f"  K  : {tuple(k.shape)}")
-        print(f"  out: {tuple(out.shape) if out is not None else 'not captured'}")
-        print(f"  heads={n_heads}  d_head={d_head}")
+        if shape_q:
+            B_loc, S, H, D = shape_q
+            print(f"  Q shape : {shape_q}  (heads={H}, d_head={D})")
 
-        # Per-frame Q-norm and K-norm  (mean over heads and spatial tokens)
-        q_frames = q.view(B_loc, T_tok, S_per_frame, n_heads, d_head)  # (B,T,Sf,H,D)
-        k_frames = k.view(B_loc, T_tok, S_per_frame, n_heads, d_head)
-        q_norm   = q_frames.norm(dim=-1).mean(dim=(-1, -2))[0]  # (T_tok,)
-        k_norm   = k_frames.norm(dim=-1).mean(dim=(-1, -2))[0]
-
-        print(f"\n  Per-frame Q-norm (mean over heads + spatial tokens):")
-        print_bar(q_norm, "  q-norm frame")
+        print(f"\n  Per-frame Q-norm  (mean over heads + spatial tokens):")
+        print_bar(q_norm, "  q-norm  frame")
         print(f"\n  Per-frame K-norm:")
-        print_bar(k_norm, "  k-norm frame")
-
-        # Per-frame output norm
-        out_norm_frame = None
-        if out is not None:
-            out_frames     = out.view(B_loc, T_tok, S_per_frame, out.shape[-1])
-            out_norm_frame = out_frames.norm(dim=-1).mean(dim=-1)[0]  # (T_tok,)
+        print_bar(k_norm, "  k-norm  frame")
+        if out_norm is not None:
             print(f"\n  Per-frame self-attn output norm:")
-            print_bar(out_norm_frame, "  out-norm  frame")
-
-        # Frame-to-frame attention matrix
-        frame_attn = compute_frame_attn(q[0:1], k[0:1], T_tok)[0]  # (T_tok, T_tok)
-        all_frame_attns.append(frame_attn)
+            print_bar(out_norm, "  out-norm frame")
 
         print(f"\n  Frame-to-frame attention score matrix")
-        print(f"  (rows=query frame, cols=key frame, softmax over key frames, head-averaged)")
+        print(f"  (rows=query frame, cols=key frame; softmax over key frames, head-averaged)")
         print(f"  [C=conditioning, G=generation]")
         print_frame_attn(frame_attn, num_cond_tok, prefix="  ")
 
-        # Conditioning↔generation breakdown for this block
         if num_cond_tok > 0 and num_cond_tok < T_tok:
             c2c = frame_attn[:num_cond_tok, :num_cond_tok].mean().item()
             g2c = frame_attn[num_cond_tok:, :num_cond_tok].mean().item()
             c2g = frame_attn[:num_cond_tok, num_cond_tok:].mean().item()
             g2g = frame_attn[num_cond_tok:, num_cond_tok:].mean().item()
-            print(f"\n  Attention flow (mean weight):  "
-                  f"COND→COND {c2c:.4f}  |  GEN→COND {g2c:.4f}  |  "
-                  f"COND→GEN {c2g:.4f}  |  GEN→GEN {g2g:.4f}")
+            print(f"\n  Attention flow:  "
+                  f"C→C {c2c:.4f}  |  G→C {g2c:.4f}  |  "
+                  f"C→G {c2g:.4f}  |  G→G {g2g:.4f}")
 
-        # Accumulate for saving
-        entry = {
-            "frame_attn": frame_attn,
-            "q_norm":     q_norm,
-            "k_norm":     k_norm,
-        }
-        if out_norm_frame is not None:
-            entry["out_norm"] = out_norm_frame
-        if args.save_qk:
-            entry["q"] = q
-            entry["k"] = k
-        blocks_save[blk_idx] = entry
+        all_frame_attns.append(frame_attn)
 
     # ------------------------------------------------------------------
-    # 11. Summary: average frame-to-frame attention across all probed blocks
+    # 11. Summary averaged across all probed blocks
     # ------------------------------------------------------------------
     mean_frame_attn = torch.stack(all_frame_attns, dim=0).mean(dim=0)  # (T_tok, T_tok)
 
@@ -530,10 +502,10 @@ def main():
         c2g = mean_frame_attn[:num_cond_tok, num_cond_tok:].mean().item()
         g2g = mean_frame_attn[num_cond_tok:, num_cond_tok:].mean().item()
         print(f"\nAttention flow (mean weight over frame pairs):")
-        print(f"  COND→COND : {c2c:.4f}")
-        print(f"  GEN→COND  : {g2c:.4f}  ← how strongly generation attends to conditioning")
-        print(f"  COND→GEN  : {c2g:.4f}")
-        print(f"  GEN→GEN   : {g2g:.4f}")
+        print(f"  C→C : {c2c:.4f}")
+        print(f"  G→C : {g2c:.4f}  ← how strongly generation attends to conditioning")
+        print(f"  C→G : {c2g:.4f}")
+        print(f"  G→G : {g2g:.4f}")
 
     # ------------------------------------------------------------------
     # 12. Save (rank 0 only)
@@ -546,22 +518,20 @@ def main():
             "token_grid":      {"T_tok": T_tok, "H_tok": H_tok, "W_tok": W_tok},
             "num_cond_tok":    num_cond_tok,
             "latent_shape":    tuple(latent_state.shape),
-            "probed_blocks":   list(blocks_save.keys()),
+            "probed_blocks":   sorted(captured.keys()),
             "mean_frame_attn": mean_frame_attn,
-            "blocks":          blocks_save,
+            "blocks":          captured,
         }
         pt_path = out_dir / "selfattn_structure.pt"
         torch.save(save_dict, pt_path)
 
         print(f"\nSaved: {pt_path}")
-        print(f"  Keys: token_grid, num_cond_tok, latent_shape, probed_blocks, "
-              f"mean_frame_attn, blocks")
-        print(f"  blocks[idx] keys: frame_attn (T,T), q_norm (T,), k_norm (T,), "
-              f"out_norm (T,)" + (", q (B,S,H,D), k (B,S,H,D)" if args.save_qk else ""))
+        print(f"  blocks[idx] keys: frame_attn (T,T), q_norm (T,), k_norm (T,), out_norm (T,)"
+              + (", q (B,S,H,D), k (B,S,H,D)" if args.save_qk else ""))
         print(f"\nTo load:")
         print(f"  import torch")
         print(f"  d = torch.load('{pt_path}', weights_only=False)")
-        print(f"  d['mean_frame_attn']           # ({T_tok}, {T_tok}) frame attention matrix")
+        print(f"  d['mean_frame_attn']              # ({T_tok},{T_tok}) frame attention matrix")
         print(f"  d['blocks'][<idx>]['frame_attn']  # per-block version")
 
 
@@ -570,29 +540,29 @@ if __name__ == "__main__":
 
 
 """
-# Example run — 5 evenly-spaced blocks (default)
-python cosmos-predict2.5/scripts/probe_selfattn_structure.py \\
-    --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \\
-    --experiment_name predict2_video2world_training_2b_libero_480 \\
-    --ckpt_path /home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/8fbc6188fa2f2e4ab585dc6aac3edd0e9d8a3670/model.pt \\
-    --prompt "Use the franka robot arm to pick up the black bowl next to the cookie box and place it on the plate" \\
-    --resolution 432,432 \\
-    --num_latent_conditional_frames 2 \\
-    --timestep 0.0 \\
-    --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \\
+# All blocks (default) — bounded RAM regardless of model depth
+python cosmos-predict2.5/scripts/probe_selfattn_structure.py \
+    --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \
+    --experiment_name predict2_video2world_training_2b_libero_480 \
+    --ckpt_path /home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/47d14a41779c654c213600ec1c35c9ebd89dd992/model.pt \
+    --prompt "Use the franka robot arm to pick up the black bowl next to the cookie box and place it on the plate" \
+    --resolution 432,432 \
+    --num_latent_conditional_frames 2 \
+    --timestep 1.0 \
+    --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \
     --offload_diffusion_model --offload_tokenizer --offload_text_encoder
 
-# Specific blocks + save raw Q/K tensors
-python cosmos-predict2.5/scripts/probe_selfattn_structure.py \\
-    --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \\
-    --experiment_name predict2_video2world_training_2b_libero_480 \\
-    --ckpt_path /home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/8fbc6188fa2f2e4ab585dc6aac3edd0e9d8a3670/model.pt \\
-    --prompt "Use the franka robot arm to pick up the black bowl next to the cookie box and place it on the plate" \\
-    --resolution 432,432 \\
-    --num_latent_conditional_frames 2 \\
-    --timestep 0.0 \\
-    --layers 0 5 10 15 20 25 \\
-    --save_qk \\
-    --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \\
+# Specific blocks + save raw Q/K tensors for further analysis
+python cosmos-predict2.5/scripts/probe_selfattn_structure.py \
+    --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \
+    --experiment_name predict2_video2world_training_2b_libero_480 \
+    --ckpt_path /home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/8fbc6188fa2f2e4ab585dc6aac3edd0e9d8a3670/model.pt \
+    --prompt "Use the franka robot arm to pick up the black bowl next to the cookie box and place it on the plate" \
+    --resolution 432,432 \
+    --num_latent_conditional_frames 2 \
+    --timestep 0.0 \
+    --layers 0 5 10 15 20 25 \
+    --save_qk \
+    --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \
     --offload_diffusion_model --offload_tokenizer --offload_text_encoder
 """
