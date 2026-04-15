@@ -420,56 +420,6 @@ def main():
     )
     x_adv = pgd(raw_padded, 0, lambda x: x, loss_fn, args.steps, args.alpha, args.eps, frames_to_extract)
 
-    delta = torch.zeros_like(raw_padded[:, :, 0:1])   # (B, C, 1, H, W)
-
-    for step in range(args.steps):
-        delta.requires_grad_(True)
-
-        # Perturb first frame, leave the rest unchanged
-        x_pert = torch.cat([
-            (raw_padded[:, :, 0:1] + delta).clamp(-1.0, 1.0),
-            raw_padded[:, :, 1:],
-        ], dim=2)   # (B, C, required_pixel_frames, H, W)
-
-        # Random diffusion timestep for this step (expectation over t)
-        t = torch.rand(1).item()
-
-        loss = compute_freeze_loss(
-            model, x_pert, condition, t, T_tok,
-            num_attack_layers=cutoff_blocks,
-        )
-
-        loss.backward()
-
-        with torch.no_grad():
-            delta_new = delta.detach() - args.alpha * delta.grad.sign()
-            delta_new = delta_new.clamp(-args.eps, args.eps)
-            # Enforce pixel bounds after adding delta to the original frame
-            delta_new = (
-                (raw_padded[:, :, 0:1] + delta_new).clamp(-1.0, 1.0)
-                - raw_padded[:, :, 0:1]
-            )
-        delta = delta_new
-
-        print(
-            f"  step {step+1:4d}/{args.steps}  "
-            f"t={t:.3f}  "
-            f"L_freeze={loss.item():.6f}  "
-            f"|δ|_∞={delta.abs().max().item():.4f}",
-            end="\r",
-        )
-
-    print()
-
-    # ------------------------------------------------------------------
-    # 8. Build final adversarial video and save
-    # ------------------------------------------------------------------
-    with torch.no_grad():
-        x_adv = torch.cat([
-            (raw_padded[:, :, 0:1] + delta).clamp(-1.0, 1.0),
-            raw_padded[:, :, 1:],
-        ], dim=2)
-
     def to_uint8_frames(t):
         """(B, C, T, H, W) float32 [-1,1] → (T, H, W, C) uint8"""
         t = t[0].cpu().float()
@@ -494,6 +444,8 @@ def main():
     print(f"  x_adv.pt / x_adv.mp4 : perturbed video")
     print(f"  x_adv_frame0.pt       : perturbed first frame (feed directly to inference)")
     print(f"  delta.pt              : raw perturbation (B,C,1,H,W)")
+    print("Evaluating Diffusion")
+    eval(inference, x_adv, args)
 
 
 if __name__ == "__main__":
