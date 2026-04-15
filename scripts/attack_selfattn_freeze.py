@@ -422,6 +422,7 @@ def main():
     loss_fn =lambda x, y: compute_freeze_loss(
         model, x, condition, T_tok,
         num_attack_layers=cutoff_blocks,
+        skip_latent=args.skip_latent
     )
     if args.skip_latent:
         with torch.no_grad():
