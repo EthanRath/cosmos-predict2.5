@@ -87,7 +87,7 @@ from cosmos_predict2._src.predict2.models.text2world_model_rectified_flow import
 import cosmos_predict2._src.predict2.inference.get_t5_emb as _t5_mod  # noqa: E402
 from probing.test_vae_encoder import load_and_preprocess_video, normalize_video  # noqa: E402
 from attack.white_box import pgd
-from attack.eval_wm import eval
+from attack.eval_wm import eval, eval_latent
 
 # ---------------------------------------------------------------------------
 # Video padding (mirrors attack_cross_attention.py)
@@ -186,7 +186,7 @@ def install_freeze_hooks(net, T_tok, loss_terms, cutoff=None):
 # Single forward pass → L_freeze scalar
 # ---------------------------------------------------------------------------
 
-def compute_freeze_loss(model, x_padded, condition, T_tok, num_attack_layers=None):
+def compute_freeze_loss(model, x_padded, condition, T_tok, num_attack_layers=None, skip_latent = False):
     """
     Encode `x_padded` through the VAE, build a noisy latent at timestep `t`,
     run the DiT with freeze hooks, and return the L_freeze scalar.
@@ -211,7 +211,10 @@ def compute_freeze_loss(model, x_padded, condition, T_tok, num_attack_layers=Non
     compute_dtype = next(model.net.parameters()).dtype
 
     # VAE encode (grads flow through when model.tokenizer.enable_grad = True)
-    latent = model.tokenizer.encode(x_padded.to(compute_dtype)).contiguous().float()
+    if skip_latent: 
+        latent = x_padded
+    else:
+        latent = model.tokenizer.encode(x_padded.to(compute_dtype)).contiguous().float()
     B, C, T_lat, H_lat, W_lat = latent.shape
 
     noise = torch.randn_like(latent)
@@ -290,6 +293,7 @@ def main():
     parser.add_argument("--context_parallel_size",   type=int, default=1)
     parser.add_argument("--config_file",
                         default="cosmos_predict2/_src/predict2/configs/video2world/config.py")
+    parser.add_argument("--skip_latent", action="store_true")
     args = parser.parse_args()
 
     device = "cuda"
@@ -419,7 +423,12 @@ def main():
         model, x, condition, T_tok,
         num_attack_layers=cutoff_blocks,
     )
-    x_adv = pgd(raw_padded, 0, lambda x: x, loss_fn, args.steps, args.alpha, args.eps, frames_to_extract)
+    if args.skip_latent:
+        with torch.no_grad():
+            latent = model.tokenizer.encode(raw_padded.to(compute_dtype)).contiguous().float()
+        x_adv = pgd(latent, 0, lambda x: x, loss_fn, args.steps, args.alpha, args.eps, frames_to_extract)
+    else:
+        x_adv = pgd(raw_padded, 0, lambda x: x, loss_fn, args.steps, args.alpha, args.eps, frames_to_extract)
 
     def to_uint8_frames(t):
         """(B, C, T, H, W) float32 [-1,1] → (T, H, W, C) uint8"""
@@ -430,19 +439,22 @@ def main():
     out_dir = WM_ROOT / "attack" / "outputs" / f"selfattn_freeze_{int(time.time())}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    torch.save(x_adv.cpu(),                      out_dir / "x_adv.pt")
-    torch.save(raw_padded.cpu(),                  out_dir / "x_orig.pt")
+    torch.save(x_adv.cpu(),                      out_dir / f"x_adv{"latent" if args.skip_latent else ""}.pt")
+    # torch.save(raw_padded.cpu(),                  out_dir / "x_orig.pt")
 
-
-    torchvision.io.write_video(
-        str(out_dir / "x_adv.mp4"),  to_uint8_frames(x_adv),     fps=16)
-    torchvision.io.write_video(
-        str(out_dir / "x_orig.mp4"), to_uint8_frames(raw_padded), fps=16)
+    if not args.skip_latent:
+        torchvision.io.write_video(
+            str(out_dir / "x_adv.mp4"),  to_uint8_frames(x_adv),     fps=16)
+        # torchvision.io.write_video(
+        #     str(out_dir / "x_orig.mp4"), to_uint8_frames(raw_padded), fps=16)
 
     print(f"\nSaved to: {out_dir}")
     print(f"  x_adv.pt / x_adv.mp4 : perturbed video")
     print("Evaluating Diffusion")
-    eval(inference, x_adv, args)
+    if args.skip_latent:
+        eval_latent(inference, x_adv, args)
+    else:
+        eval(inference, x_adv, args)
 
 
 if __name__ == "__main__":
