@@ -41,17 +41,17 @@ Saved artefacts (attack/outputs/selfattn_freeze_<timestamp>/):
     x_orig.mp4      : original video
 
 Usage:
-    python cosmos-predict2.5/scripts/attack_selfattn_freeze.py \
-        --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \
-        --experiment_name predict2_video2world_training_2b_libero_480 \
-        --ckpt_path /home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/47d14a41779c654c213600ec1c35c9ebd89dd992/model.pt \
-        --prompt "Use the franka robot arm to pick up the black bowl" \
-        --resolution 432,432 \
-        --num_latent_video_frames 9 \
-        --num_latent_conditional_frames 2 \
-        --steps 100 --alpha 0.00392 --eps 0.0628 \
-        --num_attack_layers 14 \
-        --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \
+    python cosmos-predict2.5/scripts/attack_selfattn_freeze.py \\
+        --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \\
+        --experiment_name predict2_video2world_training_2b_libero_480 \\
+        --ckpt_path /path/to/model.pt \\
+        --prompt "Use the franka robot arm to pick up the black bowl" \\
+        --resolution 432,432 \\
+        --num_latent_video_frames 9 \\
+        --num_latent_conditional_frames 2 \\
+        --steps 100 --alpha 0.00392 --eps 0.0628 \\
+        --num_attack_layers 14 \\
+        --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \\
         --offload_diffusion_model --offload_tokenizer --offload_text_encoder
 """
 
@@ -86,7 +86,8 @@ from cosmos_predict2._src.predict2.models.text2world_model_rectified_flow import
 )
 import cosmos_predict2._src.predict2.inference.get_t5_emb as _t5_mod  # noqa: E402
 from test_vae_encoder import load_and_preprocess_video, normalize_video  # noqa: E402
-
+from attack.white_box import pgd
+from attack.eval_wm import eval
 
 # ---------------------------------------------------------------------------
 # Video padding (mirrors attack_cross_attention.py)
@@ -410,6 +411,15 @@ def main():
     #    steps affect only frame 0 (the conditioning "image").
     # ------------------------------------------------------------------
     print(f"\nStarting PGD optimisation...")
+
+    t = torch.rand(1).item()
+
+    loss_fn =lambda x, y: compute_freeze_loss(
+        model, x, condition, t, T_tok,
+        num_attack_layers=cutoff_blocks,
+    )
+    x_adv = pgd(raw_padded, 0, lambda x: x, loss_fn, args.steps, args.alpha, args.eps, frames_to_extract)
+
     delta = torch.zeros_like(raw_padded[:, :, 0:1])   # (B, C, 1, H, W)
 
     for step in range(args.steps):
@@ -492,29 +502,29 @@ if __name__ == "__main__":
 
 """
 # Full sequence (24 frames), all blocks — highest quality, most VRAM
-python cosmos-predict2.5/scripts/attack_selfattn_freeze.py \
-    --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \
-    --experiment_name predict2_video2world_training_2b_libero_480 \
-    --ckpt_path /home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/47d14a41779c654c213600ec1c35c9ebd89dd992/model.pt \
-    --prompt "Use the franka robot arm to pick up the black bowl next to the cookie box and place it on the plate" \
-    --resolution 432,432 \
-    --num_latent_video_frames 24 \
-    --num_latent_conditional_frames 2 \
-    --steps 100 --alpha 0.00392 --eps 0.0628 \
-    --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \
+python cosmos-predict2.5/scripts/attack_selfattn_freeze.py \\
+    --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \\
+    --experiment_name predict2_video2world_training_2b_libero_480 \\
+    --ckpt_path /home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/47d14a41779c654c213600ec1c35c9ebd89dd992/model.pt \\
+    --prompt "Use the franka robot arm to pick up the black bowl next to the cookie box and place it on the plate" \\
+    --resolution 432,432 \\
+    --num_latent_video_frames 24 \\
+    --num_latent_conditional_frames 2 \\
+    --steps 100 --alpha 0.00392 --eps 0.0628 \\
+    --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \\
     --offload_diffusion_model --offload_tokenizer --offload_text_encoder
 
 # Reduced sequence + gradient cutoff — lower VRAM
-python cosmos-predict2.5/scripts/attack_selfattn_freeze.py \
-    --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \
-    --experiment_name predict2_video2world_training_2b_libero_480 \
-    --ckpt_path /home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/47d14a41779c654c213600ec1c35c9ebd89dd992/model.pt \
-    --prompt "Use the franka robot arm to pick up the black bowl next to the cookie box and place it on the plate" \
-    --resolution 432,432 \
-    --num_latent_video_frames 9 \
-    --num_latent_conditional_frames 2 \
-    --steps 100 --alpha 0.00392 --eps 0.0628 \
-    --num_attack_layers 14 \
-    --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \
+python cosmos-predict2.5/scripts/attack_selfattn_freeze.py \\
+    --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \\
+    --experiment_name predict2_video2world_training_2b_libero_480 \\
+    --ckpt_path /home/ethan/.cache/huggingface/hub/models--EthanRath--cosmos-predict2-libero/snapshots/47d14a41779c654c213600ec1c35c9ebd89dd992/model.pt \\
+    --prompt "Use the franka robot arm to pick up the black bowl next to the cookie box and place it on the plate" \\
+    --resolution 432,432 \\
+    --num_latent_video_frames 9 \\
+    --num_latent_conditional_frames 2 \\
+    --steps 100 --alpha 0.00392 --eps 0.0628 \\
+    --num_attack_layers 14 \\
+    --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \\
     --offload_diffusion_model --offload_tokenizer --offload_text_encoder
 """

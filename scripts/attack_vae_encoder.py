@@ -39,31 +39,33 @@ sys.path.insert(0, str(WM_ROOT))
 # ---------------------------------------------------------------------------
 # Shared helpers from test_vae_encoder
 # ---------------------------------------------------------------------------
-from test_vae_encoder import load_and_preprocess_video, normalize_video, load_vae  # noqa: E402
+from probing.test_vae_encoder import load_and_preprocess_video, normalize_video, load_vae  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Attack
 # ---------------------------------------------------------------------------
 from attack.white_box import pgd  # noqa: E402
+from attack.eval_wm import eval
+from attack.shared_config import vae_path
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--video_path",     required=True, help="Path to source input .mp4")
     parser.add_argument("--attack_target",  required=True, help="Path to target .mp4 whose encoding we optimise toward")
-    parser.add_argument("--vae_pth",        required=True, help="Path to tokenizer.pth checkpoint")
     parser.add_argument(
         "--resolution", type=int, nargs=2, default=[720, 1280],
         metavar=("H", "W"),
         help="Target resolution [H W] (default: 720 1280)",
     )
     parser.add_argument(
-        "--num_latent_video_frames", type=int, default=31,
+        "--num_latent_video_frames", type=int, default=24,
         help="Number of latent frames to encode (default: 31). Pixel frames = (n-1)*4+1.",
     )
     parser.add_argument("--steps",  type=int,   default=20,      help="PGD steps (default: 20)")
     parser.add_argument("--alpha",  type=float, default=1/255,   help="PGD step size (default: 1/255)")
     parser.add_argument("--eps",    type=float, default=64/255,  help="PGD epsilon (default: 64/255)")
+    parser.add_argument("--prompt", type=str, default="", help = "prompt for evaluating diffusion on x_adv")
     args = parser.parse_args()
     args.vae_pth = "/home/ethan/.cache/huggingface/hub/models--nvidia--Cosmos-Predict2.5-2B/snapshots/6787e176dce74a101d922174a95dba29fa5f0c55/tokenizer.pth"
 
@@ -76,6 +78,7 @@ def main():
     print(f"Epsilon {args.eps}")
     inverse_attack =  args.video_path != args.attack_target
     print(f"Inverse Attack {inverse_attack}")
+    args.vae_path = vae_path
 
     # ------------------------------------------------------------------
     # 1. Load and preprocess both videos
@@ -122,7 +125,7 @@ def main():
         sim = 1-cos_sim(encoded_target, adv_gt_z, dim=1)
     print(f"Sim Shape {sim.shape}")
     if inverse_attack:
-        loss_fn = lambda x, y: -cos_loss(x*sim,y).mean()
+        loss_fn = lambda x, y: 1-cos_loss(x*sim,y).mean()
     else:
         loss_fn = lambda x, y: cos_loss(x,y).mean()
 
@@ -132,10 +135,10 @@ def main():
         encoded_target,
         encode_fn,
         loss_fn,
+        num_frames = num_pixel_frames,
         steps=args.steps,
         alpha=args.alpha,
         eps=args.eps,
-        device=device,
     )
 
     # ------------------------------------------------------------------
@@ -152,14 +155,19 @@ def main():
 
     torch.save(x_adv.cpu(), out_dir / "x_adv.pt")
     torch.save(raw_state.cpu(), out_dir / "x_orig.pt")
-    torch.save(encoded_target.cpu(), out_dir / "encoded_target.pt")
 
     torchvision.io.write_video(str(out_dir / "x_adv.mp4"),  to_uint8_frames(x_adv),       fps=16)
     torchvision.io.write_video(str(out_dir / "x_orig.mp4"), to_uint8_frames(raw_state),   fps=16)
 
     print(f"Saved adversarial video to : {out_dir / 'x_adv.pt'} / x_adv.mp4")
     print(f"Saved original video to    : {out_dir / 'x_orig.pt'} / x_orig.mp4")
-    print(f"Saved encoded target to    : {out_dir / 'encoded_target.pt'}")
+    if args.prompt != "":
+        del(tokenizer)
+        args.adv_path = out_dir / "x_adv.pt"
+        print("Evaluating X Adv")
+        eval(None, x_adv.cpu(), args)
+
+
 
 
 if __name__ == "__main__":
