@@ -186,7 +186,7 @@ def install_freeze_hooks(net, T_tok, loss_terms, cutoff=None):
 # Single forward pass → L_freeze scalar
 # ---------------------------------------------------------------------------
 
-def compute_freeze_loss(model, x_padded, condition, t, T_tok, num_attack_layers=None):
+def compute_freeze_loss(model, x_padded, condition, T_tok, num_attack_layers=None):
     """
     Encode `x_padded` through the VAE, build a noisy latent at timestep `t`,
     run the DiT with freeze hooks, and return the L_freeze scalar.
@@ -207,6 +207,7 @@ def compute_freeze_loss(model, x_padded, condition, t, T_tok, num_attack_layers=
     -------
     l_freeze : scalar tensor with gradient graph
     """
+    t = torch.rand(1).item()
     compute_dtype = next(model.net.parameters()).dtype
 
     # VAE encode (grads flow through when model.tokenizer.enable_grad = True)
@@ -360,7 +361,7 @@ def main():
 
     # ------------------------------------------------------------------
     # 4. Offloading sequence
-    # ------------------------------------------------------------------
+    # ---------------------------------------------s---------------------
     if inference.offload_text_encoder:
         if model.text_encoder is not None:
             if hasattr(model.text_encoder, "model") and model.text_encoder.model is not None:
@@ -415,7 +416,7 @@ def main():
     t = torch.rand(1).item()
 
     loss_fn =lambda x, y: compute_freeze_loss(
-        model, x, condition, t, T_tok,
+        model, x, condition, T_tok,
         num_attack_layers=cutoff_blocks,
     )
     x_adv = pgd(raw_padded, 0, lambda x: x, loss_fn, args.steps, args.alpha, args.eps, frames_to_extract)
@@ -431,8 +432,7 @@ def main():
 
     torch.save(x_adv.cpu(),                      out_dir / "x_adv.pt")
     torch.save(raw_padded.cpu(),                  out_dir / "x_orig.pt")
-    torch.save(delta.cpu(),                       out_dir / "delta.pt")
-    torch.save(x_adv[:, :, 0:1].cpu(),           out_dir / "x_adv_frame0.pt")
+
 
     torchvision.io.write_video(
         str(out_dir / "x_adv.mp4"),  to_uint8_frames(x_adv),     fps=16)
@@ -440,10 +440,7 @@ def main():
         str(out_dir / "x_orig.mp4"), to_uint8_frames(raw_padded), fps=16)
 
     print(f"\nSaved to: {out_dir}")
-    print(f"  |δ|_∞ = {delta.abs().max().item():.4f}  (budget: {args.eps:.4f})")
     print(f"  x_adv.pt / x_adv.mp4 : perturbed video")
-    print(f"  x_adv_frame0.pt       : perturbed first frame (feed directly to inference)")
-    print(f"  delta.pt              : raw perturbation (B,C,1,H,W)")
     print("Evaluating Diffusion")
     eval(inference, x_adv, args)
 
