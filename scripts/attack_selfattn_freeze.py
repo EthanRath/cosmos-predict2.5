@@ -439,8 +439,8 @@ def main():
     out_dir = WM_ROOT / "attack" / "outputs" / f"selfattn_freeze_{int(time.time())}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    torch.save(x_adv.cpu(),                      out_dir / f"x_adv{"latent" if args.skip_latent else ""}.pt")
-    # torch.save(raw_padded.cpu(),                  out_dir / "x_orig.pt")
+    torch.save(x_adv.cpu(), out_dir / f"x_adv{args.skip_latent}.pt")
+    # torch.save(raw_padded.cpu(), out_dir / "x_orig.pt")
 
     if not args.skip_latent:
         torchvision.io.write_video(
@@ -487,5 +487,5 @@ python cosmos-predict2.5/scripts/attack_selfattn_freeze.py \
     --steps 100 --alpha 0.00392 --eps 0.0628 \
     --num_attack_layers 14 \
     --config_file cosmos_predict2/_src/predict2/configs/video2world/config.py \
-    --offload_diffusion_model --offload_tokenizer --offload_text_encoder
+    --offload_diffusion_model --offload_tokenizer --offload_text_encoder --skip_latent
 """
