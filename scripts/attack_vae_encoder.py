@@ -122,7 +122,8 @@ def main():
     encode_fn = lambda x: tokenizer.encode(x).contiguous().float()
     with torch.no_grad():
         adv_gt_z = encode_fn(raw_state)
-        sim = 1-cos_sim(encoded_target, adv_gt_z, dim=1)
+        sim = 1-cos_sim(encoded_target.flatten(start_dim=-2), adv_gt_z.flatten(start_dim=-2), dim=-1)
+        sim = sim.unsqueeze(-1).repeat(1,1,1,54,54)
     print(f"Sim Shape {sim.shape}")
     if inverse_attack:
         loss_fn = lambda x, y: 1-cos_loss(x*sim,y).mean()
