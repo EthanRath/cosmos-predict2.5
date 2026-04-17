@@ -140,6 +140,7 @@ def main():
         alpha=args.alpha,
         eps=args.eps,
     )
+    x_adv=torch.clamp(x_adv, -1, 1)
 
     # ------------------------------------------------------------------
     # 6. Save output

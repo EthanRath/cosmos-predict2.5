@@ -270,7 +270,7 @@ def compute_sim_mask(model, latent, condition, target_condition, T_tok,
 
         restore()
         print()
-        return [a.detach().cpu() / num_steps for a in accum]
+        return [a.detach() / num_steps for a in accum]
 
     print(f"  [sim_mask] running {num_steps}-step denoising for true condition...")
     true_means = _collect_mean(condition_live, "true")
@@ -279,13 +279,126 @@ def compute_sim_mask(model, latent, condition, target_condition, T_tok,
 
     # cosine similarity over text-token dim (N) → (B, T, S, H)
     # 1 - sim: high where the two prompts differ most
+    print("NEW")
     masks = [
-        (1.0 - F.cosine_similarity(s_true, s_tgt, dim=3)).detach().cuda()
+        (1.0 - F.cosine_similarity(s_true, s_tgt, dim=3)).detach()
         for s_true, s_tgt in zip(true_means, tgt_means)
     ]
+    #Normalize mask per layer
+    for i in range(len(masks)):
+        mi = masks[i].min()
+        mx = masks[i].max()
+        masks[i] = (masks[i] - mi) / (mx - mi)
     print(f"  [sim_mask] {len(masks)} layer masks, shape {masks[0].shape}, "
           f"range [{masks[0].min():.3f}, {masks[0].max():.3f}]")
     return masks
+
+
+# ---------------------------------------------------------------------------
+# Sim-mask dimensionality analysis (debugging)
+# ---------------------------------------------------------------------------
+
+def analyze_sim_masks(masks, spatial_grid=27, save_dir=None):
+    """
+    Print per-dimension statistics for a list of sim masks and optionally save
+    spatial heatmaps.  Call this immediately after compute_sim_mask.
+
+    masks      : list of (B, T, S, H) tensors — one per hooked layer
+    spatial_grid : sqrt(S), i.e. 27 for 432×432 with patch size 16
+    save_dir   : if set, saves one PNG heatmap per layer (spatially averaged
+                 over T and H) using matplotlib
+
+    Reports
+    -------
+    Layer      : mean mask value per layer — which DiT blocks are most discriminative
+    Temporal   : mean over (B, S, H) → (T,) — which frames differ most
+    Head       : mean over (B, T, S) → (H,) — which attention heads are most discriminative
+    Spatial    : mean over (B, T, H) → (S,) reshaped to (grid, grid) — peak patches
+    """
+    import numpy as np
+
+    L = len(masks)
+    B, T, S, H = masks[0].shape
+
+    print(f"\n{'='*60}")
+    print(f"Sim-mask analysis  |  {L} layers, shape (B={B}, T={T}, S={S}, H={H})")
+    print(f"{'='*60}")
+
+    # -- Layer --
+    layer_means = [m.mean().item() for m in masks]
+    layer_vars  = [m.var().item()  for m in masks]
+    top_layers  = sorted(range(L), key=lambda i: layer_means[i], reverse=True)[:5]
+    print(f"\n[Layer]  mean difference per layer (top 5 most discriminative):")
+    for i in top_layers:
+        print(f"  layer {i:3d}  mean={layer_means[i]:.4f}  var={layer_vars[i]:.4f}")
+
+    # -- Aggregate mask across all layers for the remaining analyses --
+    agg = torch.stack(masks).mean(dim=0)   # (B, T, S, H)
+    agg = agg[0]                           # drop batch → (T, S, H)
+
+    # -- Temporal --
+    temporal = agg.mean(dim=(1, 2))        # (T,)
+    print(f"\n[Temporal]  mean difference per frame:")
+    for t_i, val in enumerate(temporal.tolist()):
+        bar = "█" * int(val / temporal.max().item() * 20)
+        print(f"  frame {t_i:2d}  {val:.4f}  {bar}")
+
+    # -- Head --
+    head = agg.mean(dim=(0, 1))            # (H,)
+    top_heads = head.argsort(descending=True)
+    print(f"\n[Head]  mean difference per attention head (ranked):")
+    for rank, h_i in enumerate(top_heads.tolist()):
+        bar = "█" * int(head[h_i].item() / head.max().item() * 20)
+        print(f"  rank {rank:2d}  head {h_i:2d}  {head[h_i].item():.4f}  {bar}")
+
+    # -- Spatial --
+    spatial = agg.mean(dim=(0, 2))         # (S,) — averaged over T and H
+    sp_grid = spatial.reshape(spatial_grid, spatial_grid)
+    sp_np   = sp_grid.cpu().float().numpy()
+    top_k   = int(S * 0.05)               # top 5% of patches
+    flat    = spatial.cpu()
+    top_idx = flat.argsort(descending=True)[:top_k]
+    top_coords = [(int(i) // spatial_grid, int(i) % spatial_grid) for i in top_idx]
+    print(f"\n[Spatial]  top {top_k} patches (row, col) with highest avg difference:")
+    for row, col in top_coords[:10]:
+        print(f"  patch ({row:2d}, {col:2d})  val={sp_grid[row, col].item():.4f}")
+    print(f"  spatial range  [{spatial.min().item():.4f}, {spatial.max().item():.4f}]")
+
+    # -- Variance analysis: which dim has the most spread? --
+    print(f"\n[Variance across dims — higher = more information in that axis]")
+    print(f"  layer    var: {np.var(layer_means):.6f}")
+    print(f"  temporal var: {temporal.var().item():.6f}")
+    print(f"  head     var: {head.var().item():.6f}")
+    print(f"  spatial  var: {spatial.var().item():.6f}")
+
+    if save_dir is not None:
+        try:
+            import matplotlib.pyplot as plt
+            save_dir = Path(save_dir)
+            save_dir.mkdir(parents=True, exist_ok=True)
+            for l_i, m in enumerate(masks):
+                # average over B, T, H → spatial heatmap
+                sp = m[0].mean(dim=(0, 2)).reshape(spatial_grid, spatial_grid)
+                fig, ax = plt.subplots(figsize=(5, 5))
+                im = ax.imshow(sp.cpu().float().numpy(), cmap="hot", interpolation="nearest")
+                ax.set_title(f"Layer {l_i}  spatial diff")
+                plt.colorbar(im, ax=ax)
+                fig.savefig(save_dir / f"sim_mask_layer_{l_i:03d}.png", dpi=80,
+                            bbox_inches="tight")
+                plt.close(fig)
+            # also save the layer-aggregated map
+            agg_sp = sp_grid
+            fig, ax = plt.subplots(figsize=(5, 5))
+            im = ax.imshow(sp_np, cmap="hot", interpolation="nearest")
+            ax.set_title("All layers aggregated spatial diff")
+            plt.colorbar(im, ax=ax)
+            fig.savefig(save_dir / "sim_mask_agg.png", dpi=80, bbox_inches="tight")
+            plt.close(fig)
+            print(f"\n  Saved heatmaps to {save_dir}")
+        except ImportError:
+            print("  [warn] matplotlib not available — skipping heatmap save")
+
+    print(f"{'='*60}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -592,7 +705,8 @@ def attack_single_video(
             num_attack_layers=cutoff_blocks,
             num_latent_conditional_frames=args.num_latent_conditional_frames,
             noise_seed=0,
-        )
+        )                                                                  
+        analyze_sim_masks(sim_masks, spatial_grid=27, save_dir= "sim_analysis")
 
     loss_fn = lambda x, y: compute_crossattn_loss(
         model, x, condition, T_tok,
