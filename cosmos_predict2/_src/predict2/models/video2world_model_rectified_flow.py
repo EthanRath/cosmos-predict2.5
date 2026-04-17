@@ -111,7 +111,7 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
                     torch.ones_like(condition_video_mask_B_1_T_1_1) * self.config.conditional_frame_timestep
                 )
 
-                timesteps_B_1_T_1_1 = timestep_cond_B_1_T_1_1 * condition_video_mask_B_1_T_1_1 + timesteps_B_T * (
+                timesteps_B_1_T_1_1 = timestep_cond_B_1_T_1_1 * condition_video_mask_B_1_T_1_1 + timesteps_B_T[:, None, :, None, None] * (
                     1 - condition_video_mask_B_1_T_1_1
                 )
 
@@ -121,10 +121,11 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
                 )  # add dimension for batch
 
         # forward pass through the network
+        _cond_dict = condition.to_dict()
         net_output_B_C_T_H_W = self.net(
             x_B_C_T_H_W=xt_B_C_T_H_W.to(**self.tensor_kwargs),  # Eq. 7 of https://arxiv.org/pdf/2206.00364.pdf
             timesteps_B_T=timesteps_B_T,  # Eq. 7 of https://arxiv.org/pdf/2206.00364.pdf
-            **condition.to_dict(),
+            **_cond_dict,
         ).float()
 
         if condition.is_video and self.config.denoise_replace_gt_frames:

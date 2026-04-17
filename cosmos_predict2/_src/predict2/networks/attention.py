@@ -134,6 +134,7 @@ def attention(
                 SDPBackend.CUDNN_ATTENTION,
                 SDPBackend.FLASH_ATTENTION,
                 SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
             ]
             BEST_SDPA_BACKEND = SDPBackend.CUDNN_ATTENTION
         elif is_half:
@@ -141,11 +142,12 @@ def attention(
                 SDPBackend.FLASH_ATTENTION,
                 SDPBackend.CUDNN_ATTENTION,
                 SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
             ]
             BEST_SDPA_BACKEND = SDPBackend.FLASH_ATTENTION if compute_cap >= 80 else SDPBackend.EFFICIENT_ATTENTION
         else:
             assert dtype == torch.float32, f"Unrecognized {dtype=}."
-            SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION]
+            SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
             BEST_SDPA_BACKEND = SDPBackend.EFFICIENT_ATTENTION
 
         if deterministic:
@@ -153,15 +155,18 @@ def attention(
                 "Deterministic mode in attention is only supported when Flash Attention 3 is available."
             )
 
-        # Torch 2.6 and later allows priorities for backends, but for older versions
-        # we can only run with a specific backend. As long as we pick ones we're certain
-        # will work on that device, it should be fine.
+        # Torch 2.6+ supports priority-ordered backend selection.
+        # The kwarg was set_priority_order in 2.6 and renamed to set_priority in 2.7.
         try:
-            sdpa_kernel(backends=SDPA_BACKENDS, set_priority_order=True)
-            sdpa_kernel_ = partial(sdpa_kernel, set_priority_order=True)
+            sdpa_kernel(backends=SDPA_BACKENDS, set_priority=True)
+            sdpa_kernel_ = partial(sdpa_kernel, set_priority=True)
         except TypeError:
-            sdpa_kernel_ = sdpa_kernel
-            SDPA_BACKENDS = [BEST_SDPA_BACKEND]
+            try:
+                sdpa_kernel(backends=SDPA_BACKENDS, set_priority_order=True)
+                sdpa_kernel_ = partial(sdpa_kernel, set_priority_order=True)
+            except TypeError:
+                # Older PyTorch without priority ordering: enable all listed backends.
+                sdpa_kernel_ = sdpa_kernel
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
