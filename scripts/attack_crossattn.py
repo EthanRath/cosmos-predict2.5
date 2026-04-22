@@ -13,7 +13,7 @@ Loss (cross-attention analogue of the L_freeze objective):
 
     L_cross = (1/L) * Σ_l  ||S^(l)||_F^2
 
-where S^(l) is the per-layer pre-softmax cross-attention score matrix.
+where S^(l) is the per-layer post-softmax cross-attention weight matrix.
 Because Q has shape (B, S, H, D) with S = T*H_patch*W_patch (potentially
 very large), we use the same spatial-mean approximation as the freeze
 attack: Q is averaged over spatial tokens within each temporal frame,
@@ -445,12 +445,12 @@ def compute_crossattn_loss(model, x_padded, condition, T_tok, num_attack_layers=
     B, C, T_lat, H_lat, W_lat = latent.shape
 
     def _build_live(cond):
-        return cond.set_video_condition(
-            gt_frames=latent.to(compute_dtype),
-            random_min_num_conditional_frames=0,
-            random_max_num_conditional_frames=0,
-            num_conditional_frames=num_latent_conditional_frames,
-        )
+        # Preserve all fields set by edit_for_inference (including _cond_mask)
+        # by copying the full dict and patching only gt_frames, matching the
+        # working self-attention approach.
+        cond_dict = cond.to_dict(skip_underscore=False)
+        cond_dict['gt_frames'] = latent.to(compute_dtype)
+        return type(cond)(**cond_dict)
 
     condition_live    = _build_live(condition)
     uncondition_live  = _build_live(uncondition)  if uncondition  is not None else None
