@@ -736,7 +736,7 @@ def attack_single_video(
             num_latent_conditional_frames=args.num_latent_conditional_frames,
             noise_seed=0
         )                                                                  
-    #     analyze_sim_masks(sim_masks, spatial_grid=27, save_dir= "sim_analysis")
+        analyze_sim_masks(sim_masks, spatial_grid=27, save_dir= "sim_analysis")
     
 
     loss_fn = lambda x, y: compute_crossattn_loss(
