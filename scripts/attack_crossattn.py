@@ -33,8 +33,10 @@ VRAM knobs
 ----------
 --num_latent_video_frames   Reduce below the model's default state_t to shorten
                             the latent sequence.  Default: 24.
---num_attack_layers         Cut the gradient graph after this many DiT blocks.
-                            Default: all blocks.
+--attack_layers_start       First DiT block index to include in the loss (inclusive,
+                            default: 0).
+--attack_layers_end         Last DiT block index to include in the loss (inclusive).
+                            Gradient graph is cut after this block. Default: all blocks.
 
 Input modes
 -----------
@@ -54,7 +56,7 @@ Usage (single video):
         --num_latent_video_frames 9 \
         --num_latent_conditional_frames 2 \
         --steps 100 --alpha 0.00392 --eps 0.0628 \
-        --num_attack_layers 14
+        --attack_layers_end 13
 
 Usage (batch):
     python cosmos-predict2.5/scripts/attack_crossattn.py \
@@ -64,7 +66,7 @@ Usage (batch):
         --num_latent_video_frames 9 \
         --num_latent_conditional_frames 2 \
         --steps 100 --alpha 0.00392 --eps 0.0628 \
-        --num_attack_layers 14 --skip_latent
+        --attack_layers_end 13 --skip_latent
 """
 
 import argparse
@@ -129,9 +131,9 @@ def pad_video(video, frames_to_extract, required_pixel_frames):
 # Cross-attention loss hooks
 # ---------------------------------------------------------------------------
 
-def install_crossattn_hooks(net, T_tok, loss_terms, cutoff=None):
+def install_crossattn_hooks(net, T_tok, loss_terms, layer_start=0, layer_end=None):
     """
-    Wrap block.cross_attn.compute_attention on every block up to `cutoff`.
+    Wrap block.cross_attn.compute_attention on blocks [layer_start, layer_end].
 
     For each intercepted block the wrapper:
       1. Computes the spatial-mean Q per temporal frame → (B, T, H, D)
@@ -148,10 +150,11 @@ def install_crossattn_hooks(net, T_tok, loss_terms, cutoff=None):
 
     Parameters
     ----------
-    net        : the DiT net (model.net)
-    T_tok      : number of temporal token-frames
-    loss_terms : list — raw (B, T, N, H) score tensors appended during forward
-    cutoff     : block index beyond which hooks are not installed
+    net         : the DiT net (model.net)
+    T_tok       : number of temporal token-frames
+    loss_terms  : list — raw (B, T, N, H) score tensors appended during forward
+    layer_start : first block index to hook (inclusive, default: 0)
+    layer_end   : last block index to hook (inclusive, default: last block)
 
     Returns
     -------
@@ -159,9 +162,9 @@ def install_crossattn_hooks(net, T_tok, loss_terms, cutoff=None):
     """
     _patches = {}
     n_blocks = len(net.blocks)
-    limit    = cutoff if cutoff is not None else n_blocks
+    end      = layer_end if layer_end is not None else n_blocks - 1
 
-    for idx in range(limit):
+    for idx in range(layer_start, end + 1):
         if idx >= n_blocks:
             break
         block = net.blocks[idx]
@@ -214,7 +217,7 @@ def install_crossattn_hooks(net, T_tok, loss_terms, cutoff=None):
 # ---------------------------------------------------------------------------
 
 def compute_sim_mask(model, latent, condition, target_condition, T_tok,
-                     num_attack_layers=None, num_latent_conditional_frames=2,
+                     layer_start=0, layer_end=None, num_latent_conditional_frames=2,
                      noise_seed=0, num_steps=36):
     """
     Run a full `num_steps`-step Euler denoising trajectory (no grad) with each
@@ -258,7 +261,7 @@ def compute_sim_mask(model, latent, condition, target_condition, T_tok,
         step_buf: list = []
         accum    = None
 
-        restore = install_crossattn_hooks(model.net, T_tok, step_buf, num_attack_layers)
+        restore = install_crossattn_hooks(model.net, T_tok, step_buf, layer_start, layer_end)
         for step_i, t in enumerate(timesteps_schedule):
             xt        = x_t.to(**model.tensor_kwargs)
             # Scheduler gives scalar t in [0, 1000]; expand to (B, 1)
@@ -418,7 +421,7 @@ def analyze_sim_masks(masks, spatial_grid=27, save_dir=None):
 # Multi-step denoising forward passes → L_cross scalar
 # ---------------------------------------------------------------------------
 
-def compute_crossattn_loss(model, x_padded, condition, T_tok, num_attack_layers=None,
+def compute_crossattn_loss(model, x_padded, condition, T_tok, layer_start=0, layer_end=None,
                            skip_latent=False, max_att=False, denoise_steps=1,
                            uncondition=None, guidance_scale=7.0,
                            target_condition=None, noise_seed=None,
@@ -457,18 +460,20 @@ def compute_crossattn_loss(model, x_padded, condition, T_tok, num_attack_layers=
     target_cond_live  = _build_live(target_condition) if target_condition is not None else None
 
     n_blocks = len(model.net.blocks)
-    cutoff   = num_attack_layers
 
     loss_terms = []
-    restore    = install_crossattn_hooks(model.net, T_tok, loss_terms, cutoff)
+    restore    = install_crossattn_hooks(model.net, T_tok, loss_terms, layer_start, layer_end)
 
+    # Cut the gradient graph after layer_end so blocks beyond it don't accumulate
+    # activations in the backward pass.
     detach_hook = None
-    if cutoff is not None and cutoff < n_blocks:
+    effective_end = layer_end if layer_end is not None else n_blocks - 1
+    if effective_end < n_blocks - 1:
         def _detach(_m, _inp, output):
             if isinstance(output, tuple):
                 return (output[0].detach(),) + output[1:]
             return output.detach()
-        detach_hook = model.net.blocks[cutoff - 1].register_forward_hook(_detach)
+        detach_hook = model.net.blocks[effective_end].register_forward_hook(_detach)
 
     if noise_seed is not None:
         gen   = torch.Generator(device=latent.device).manual_seed(noise_seed)
@@ -572,7 +577,7 @@ def compute_crossattn_loss(model, x_padded, condition, T_tok, num_attack_layers=
 def attack_single_video(
     inference, model, video_path, prompt,
     H, W, frames_to_extract, required_pixel_frames,
-    T_tok, cutoff_blocks, compute_dtype, args,
+    T_tok, layer_start, layer_end, compute_dtype, args,
     device="cuda", save_time=None
 ):
     """
@@ -726,7 +731,8 @@ def attack_single_video(
         print("Computing spatial sim mask...")
         sim_masks = compute_sim_mask(
             model, latent, condition, target_condition_template, T_tok,
-            num_attack_layers=cutoff_blocks,
+            layer_start=layer_start,
+            layer_end=layer_end,
             num_latent_conditional_frames=args.num_latent_conditional_frames,
             noise_seed=0
         )                                                                  
@@ -735,7 +741,8 @@ def attack_single_video(
 
     loss_fn = lambda x, y: compute_crossattn_loss(
         model, x, condition, T_tok,
-        num_attack_layers=cutoff_blocks,
+        layer_start=layer_start,
+        layer_end=layer_end,
         skip_latent=args.skip_latent,
         max_att=args.max_att,
         denoise_steps=args.denoise_steps,
@@ -801,6 +808,11 @@ def main():
                              "pattern of (x_orig, --target_prompt), encouraging the "
                              "model to generate video as if given --target_prompt. "
                              "Omit for the untargeted (attention-suppression) attack.")
+    parser.add_argument("--batch_targets", action="store_true",
+                        help="Read per-video target prompts from a metas-target/ "
+                             "subfolder alongside --batch_path.  Each <name>.txt in "
+                             "metas-target/ must match a <name>.mp4 in videos/.  "
+                             "Overrides --target_prompt for batch runs.")
     parser.add_argument("--attack_num", type=int, default=-1,
                         help="Number of videos to sample from --batch_path "
                              "(-1 = use all, default: -1)")
@@ -821,11 +833,13 @@ def main():
                         help="PGD step size (default: 2/255 ≈ 0.00784)")
     parser.add_argument("--eps",             type=float, default=16/255,
                         help="L∞ perturbation budget (default: 16/255 ≈ 0.0628)")
-    parser.add_argument("--num_attack_layers", type=int, default=None,
-                        help="Only include the first N DiT blocks in the loss / "
-                             "gradient graph. Drastically reduces peak VRAM. "
-                             "Grad is cut at block N; forward still runs fully. "
-                             "Default: all blocks.")
+    parser.add_argument("--attack_layers_start", type=int, default=0,
+                        help="First DiT block index to include in the cross-attention "
+                             "loss (inclusive). Default: 0.")
+    parser.add_argument("--attack_layers_end", type=int, default=None,
+                        help="Last DiT block index to include in the cross-attention "
+                             "loss (inclusive). Gradient graph is cut after this block. "
+                             "Default: all remaining blocks.")
     parser.add_argument("--load_diffusion_model", action="store_true",
                         help="Keep diffusion model on GPU (default: offload to CPU)")
     parser.add_argument("--load_text_encoder",    action="store_true",
@@ -884,19 +898,25 @@ def main():
     frames_to_extract     = (args.num_latent_conditional_frames - 1) * 4 + 1
     T_tok                 = T_lat_attack
 
-    cutoff_blocks = args.num_attack_layers   # None = all
+    layer_start   = args.attack_layers_start
+    layer_end     = args.attack_layers_end    # None = last block
     compute_dtype = torch.bfloat16
+
+    effective_end = layer_end if layer_end is not None else n_blocks - 1
 
     print(f"Model         : {n_blocks} DiT blocks, state_t={state_t}")
     print(f"Attack T_lat  : {T_lat_attack}  (pixel frames: {required_pixel_frames})")
     print(f"T_tok         : {T_tok}  (frame × text-token cross-attn matrix: {T_tok}×N)")
-    print(f"Loss blocks   : {cutoff_blocks or n_blocks}/{n_blocks}  "
-          f"(gradient cut after block {(cutoff_blocks or n_blocks) - 1})")
+    print(f"Loss blocks   : [{layer_start}, {effective_end}]  "
+          f"(gradient cut after block {effective_end})")
     print(f"PGD           : steps={args.steps}  alpha={args.alpha:.5f}  eps={args.eps:.4f}")
 
     # ------------------------------------------------------------------
-    # Collect (video_path, prompt) pairs
+    # Collect (video_path, prompt, target_prompt) triples
     # ------------------------------------------------------------------
+    if args.batch_targets and args.batch_path is None:
+        parser.error("--batch_targets requires --batch_path")
+
     if args.batch_path is not None:
         batch_path  = Path(args.batch_path)
         video_files = sorted((batch_path / "videos").glob("*.mp4"))
@@ -905,10 +925,16 @@ def main():
         pairs = []
         for vf in video_files:
             meta_path = batch_path / "metas" / (vf.stem + ".txt")
-            pairs.append((vf, meta_path.read_text().strip()))
-        print(f"\nBatch mode: {len(pairs)} video(s) from {batch_path}")
+            if args.batch_targets:
+                tgt_path = batch_path / "metas-target" / (vf.stem + ".txt")
+                target_prompt = tgt_path.read_text().strip()
+            else:
+                target_prompt = args.target_prompt
+            pairs.append((vf, meta_path.read_text().strip(), target_prompt))
+        print(f"\nBatch mode: {len(pairs)} video(s) from {batch_path}"
+              + (" (per-video target prompts from metas-target/)" if args.batch_targets else ""))
     else:
-        pairs = [(Path(args.video_path), args.prompt)]
+        pairs = [(Path(args.video_path), args.prompt, args.target_prompt)]
 
     # ------------------------------------------------------------------
     # Attack each video
@@ -926,25 +952,29 @@ def main():
         "required_pixel_frames": required_pixel_frames,
         "frames_to_extract": frames_to_extract,
         "T_tok": T_tok,
-        "cutoff_blocks": cutoff_blocks,
+        "layer_start": layer_start,
+        "layer_end": layer_end,
         "n_blocks": n_blocks,
         "save_time": save_time,
         "out_dir": str(out_dir),
-        "batch_pairs": [(str(vp), pr) for vp, pr in pairs],
+        "batch_pairs": [(str(vp), pr, tp) for vp, pr, tp in pairs],
     }
     with open(out_dir / "attack_config.json", "w") as _f:
         json.dump(attack_config, _f, indent=2)
     print(f"Attack config saved to: {out_dir / 'attack_config.json'}")
 
-    for i, (video_path, prompt) in enumerate(pairs):
+    for i, (video_path, prompt, target_prompt) in enumerate(pairs):
         print(f"\n{'='*60}")
         print(f"Video {i+1}/{len(pairs)}: {video_path.name}")
         print(f"Prompt: {prompt}")
+        if target_prompt is not None:
+            print(f"Target: {target_prompt}")
         print(f"{'='*60}")
+        args.target_prompt = target_prompt
         x_adv = attack_single_video(
             inference, model, video_path, prompt,
             H, W, frames_to_extract, required_pixel_frames,
-            T_tok, cutoff_blocks, compute_dtype, args,
+            T_tok, layer_start, layer_end, compute_dtype, args,
             device=device, save_time=save_time,
         )
         all_x_adv.append(x_adv)
