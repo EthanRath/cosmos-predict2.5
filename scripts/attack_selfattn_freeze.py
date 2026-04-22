@@ -75,6 +75,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 import torchvision
 
 # ---------------------------------------------------------------------------
@@ -178,12 +179,12 @@ def install_freeze_hooks(net, T_tok, loss_terms, cutoff=None):
                 q_frame = q.view(B, T_tok, S_per_frame, H, D).mean(dim=2)
                 k_frame = k.view(B, T_tok, S_per_frame, H, D).mean(dim=2)
 
-                # (B, T_qi, T_kj, H) raw score matrix — no softmax
+                # (B, T_qi, T_kj, H) attention weights — softmax over key-frame dim
                 scores = torch.einsum("bihd,bjhd->bijh", q_frame, k_frame) * scale
+                attn_weights = F.softmax(scores, dim=2)  # softmax over j (key-frame)
 
-                # ||scores||_F^2 / (B*H): drives Q and K toward orthogonality
-                # across temporal frames, directly suppressing attention magnitude.
-                block_loss = scores.pow(2).sum() / (B * H)
+                # ||A||_F^2 / (B*H): minimising post-softmax weights → uniform attention
+                block_loss = attn_weights.pow(2).sum() / (B * H)
                 loss_terms.append(block_loss)
 
                 return fn(q, k, v, **kw)
@@ -296,20 +297,24 @@ def compute_freeze_loss(model, x_padded, condition, T_tok, num_attack_layers=Non
         #   1. Replace xt[cond] with condition_live.gt_frames (= current latent)
         #   2. Override timesteps[cond] with conditional_frame_timestep (if set)
         #   3. Call model.net(xt, ...) — hooks fire here
-        t         = torch.rand(1).item()
-        xt        = ((1 - t) * latent + t * noise).to(**model.tensor_kwargs)
-        timesteps = torch.full((B, T_lat), t, device=latent.device, dtype=latent.dtype)
+        t_norm    = torch.rand(1).item()   # ∈ [0, 1] for interpolation
+        xt        = ((1 - t_norm) * latent + t_norm * noise).to(**model.tensor_kwargs)
+        timesteps = torch.full((B, T_lat), t_norm * 1000.0, device=latent.device, dtype=latent.dtype)
         model.denoise(noise=noise, xt_B_C_T_H_W=xt, timesteps_B_T=timesteps,
                       condition=condition_live)
     else:
-        # K-step Euler trajectory from t=1 (noise) toward t=0 (clean).
-        dt  = 1.0 / denoise_steps
+        # K-step Euler trajectory using the model's own scheduler for timesteps.
+        # Use differentiable manual Euler (not sample_scheduler.step()) so gradients
+        # flow back through the full x_t chain to the perturbed input.
+        model.sample_scheduler.set_timesteps(denoise_steps, device=latent.device, shift=5.0)
+        sched_ts = model.sample_scheduler.timesteps   # in [0, 1000], length = denoise_steps
         x_t = noise.float()   # start from pure noise; denoise() pins cond frames each step
 
         for step_i in range(denoise_steps):
-            t         = 1.0 - step_i * dt
+            t_model = sched_ts[step_i]
+            t_next  = sched_ts[step_i + 1] if step_i + 1 < denoise_steps else sched_ts.new_tensor(0.0)
             xt        = x_t.to(**model.tensor_kwargs)
-            timesteps = torch.full((B, T_lat), t, device=latent.device, dtype=latent.dtype)
+            timesteps = t_model.reshape(1, 1).expand(B, 1).to(device=latent.device, dtype=latent.dtype)
 
             if uncondition_live is not None:
                 # CFG: uncond pass under no_grad — trim spurious hook terms.
@@ -330,8 +335,9 @@ def compute_freeze_loss(model, x_padded, condition, T_tok, num_attack_layers=Non
             else:
                 v_pred = cond_v
 
-            # Euler step: x_{t-dt} = x_t - dt * v_pred
-            x_t = x_t - dt * v_pred.float()
+            # Differentiable Euler step: dt in normalised [0,1] space
+            dt_norm = (t_model - t_next).item() / 1000.0
+            x_t = x_t - dt_norm * v_pred.float()
             # No need to re-pin cond frames manually: denoise() handles it next step
 
     # Do NOT call restore() or detach_hook.remove() here.

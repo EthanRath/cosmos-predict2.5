@@ -1,6 +1,6 @@
 {
     "inference_type": "video2world",
-    "name": "attac",
-    "input_path": "x_adv.mp4",
-    "prompt": "Use the franka robot arm to pick up the black bowl next to the cookie box and place it on the plate"
+    "name": "testk1-2",
+    "input_path": "k_1.mp4",
+    "prompt": "Use the franka robot arm to place the cookie box on top of the cabinet"
 }

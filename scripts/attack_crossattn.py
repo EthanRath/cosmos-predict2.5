@@ -188,9 +188,13 @@ def install_crossattn_hooks(net, T_tok, loss_terms, cutoff=None):
                     "btshd,bnhd->btsnh", q_spatial.float(), k.float()
                 ) * scale
 
-                # Store raw scores; the loss is computed from these in
-                # compute_crossattn_loss depending on the attack mode.
-                loss_terms.append(scores)
+                # Apply softmax over the text-token (N) dimension to get the
+                # actual attention weights used in the paper's loss (Eq. 1-3, 7).
+                # Raw pre-softmax scores are unbounded; the post-softmax weights
+                # live in [0,1] and sum to 1 over N, which is what the paper
+                # minimises (||A||_F^2) or matches (cosine similarity).
+                attn_weights = F.softmax(scores, dim=3)
+                loss_terms.append(attn_weights)
 
                 return fn(q, k, v, **kw)
             return _wrapper
@@ -240,19 +244,25 @@ def compute_sim_mask(model, latent, condition, target_condition, T_tok,
     gen   = torch.Generator(device=latent.device).manual_seed(noise_seed)
     noise = torch.randn(latent.shape, generator=gen,
                         dtype=latent.dtype, device=latent.device)
-    dt    = 1.0 / num_steps
 
     def _collect_mean(cond_live, label):
-        """Euler trajectory → per-layer mean score tensor."""
+        """Denoising trajectory → per-layer mean score tensor."""
+        # Reset scheduler state before each trajectory so the multi-step solver
+        # starts fresh (its internal step counter and model-output history are
+        # consumed after one full run and must be re-initialised).
+        model.sample_scheduler.set_timesteps(num_steps, device=latent.device, shift=5.0)
+        timesteps_schedule = model.sample_scheduler.timesteps
+        seed_g = torch.Generator(device=latent.device).manual_seed(noise_seed)
+
         x_t      = noise.clone().float()
         step_buf: list = []
         accum    = None
 
         restore = install_crossattn_hooks(model.net, T_tok, step_buf, num_attack_layers)
-        for step_i in range(num_steps):
-            t         = 1.0 - step_i * dt
+        for step_i, t in enumerate(timesteps_schedule):
             xt        = x_t.to(**model.tensor_kwargs)
-            timesteps = torch.full((B, T_lat), t, device=latent.device, dtype=latent.dtype)
+            # Scheduler gives scalar t in [0, 1000]; expand to (B, 1)
+            timesteps = t.reshape(1, 1).expand(B, 1).to(device=latent.device, dtype=latent.dtype)
 
             del step_buf[:]   # free previous step's tensors before the next forward
             with torch.no_grad():
@@ -265,7 +275,10 @@ def compute_sim_mask(model, latent, condition, target_condition, T_tok,
                 for i, s in enumerate(step_buf):
                     accum[i].add_(s.detach())
 
-            x_t = x_t - dt * v.float()
+            x_t = model.sample_scheduler.step(
+                v.float().unsqueeze(0), t, x_t.unsqueeze(0),
+                return_dict=False, generator=seed_g,
+            )[0].squeeze(0)
             print(f"  [sim_mask:{label}] step {step_i+1}/{num_steps}", end="\r")
 
         restore()
@@ -467,9 +480,10 @@ def compute_crossattn_loss(model, x_padded, condition, T_tok, num_attack_layers=
     target_terms = []
 
     if denoise_steps == 1:
-        t         = torch.rand(1).item()
-        xt        = ((1 - t) * latent + t * noise).to(**model.tensor_kwargs)
-        timesteps = torch.full((B, T_lat), t, device=latent.device, dtype=latent.dtype)
+        t_norm    = torch.rand(1).item()                        # ∈ [0, 1] for interpolation
+        xt        = ((1 - t_norm) * latent + t_norm * noise).to(**model.tensor_kwargs)
+        # Model expects timesteps in [0, 1000]; scale accordingly
+        timesteps = torch.full((B, T_lat), t_norm * 1000.0, device=latent.device, dtype=latent.dtype)
 
         if target_cond_live is not None:
             n_before = len(loss_terms)
@@ -482,13 +496,20 @@ def compute_crossattn_loss(model, x_padded, condition, T_tok, num_attack_layers=
         model.denoise(noise=noise, xt_B_C_T_H_W=xt, timesteps_B_T=timesteps,
                       condition=condition_live)
     else:
-        dt  = 1.0 / denoise_steps
+        # Use the model's scheduler for properly-scaled timesteps in [0, 1000].
+        # We only need its t values here; the Euler update stays as plain arithmetic
+        # so that gradients can flow back through the entire x_t chain into loss_terms.
+        model.sample_scheduler.set_timesteps(denoise_steps, device=latent.device, shift=5.0)
+        sched_ts = model.sample_scheduler.timesteps   # shape (denoise_steps,) in [0, 1000]
         x_t = noise.float()
 
         for step_i in range(denoise_steps):
-            t         = 1.0 - step_i * dt
+            t_model = sched_ts[step_i]
+            t_next  = sched_ts[step_i + 1] if step_i + 1 < denoise_steps else sched_ts.new_tensor(0.0)
+
             xt        = x_t.to(**model.tensor_kwargs)
-            timesteps = torch.full((B, T_lat), t, device=latent.device, dtype=latent.dtype)
+            # (B, 1) scalar timestep in [0, 1000]
+            timesteps = t_model.reshape(1, 1).expand(B, 1).to(device=latent.device, dtype=latent.dtype)
 
             # Target pass at the same xt — no grad, hooks route into target_terms
             if target_cond_live is not None:
@@ -514,7 +535,9 @@ def compute_crossattn_loss(model, x_padded, condition, T_tok, num_attack_layers=
 
             v_pred = (cond_v + guidance_scale * (cond_v - uncond_v)
                       if uncondition_live is not None else cond_v)
-            x_t = x_t - dt * v_pred.float()
+            # Differentiable Euler step: dt in normalised [0,1] space = (t_curr - t_next) / 1000
+            dt_norm = (t_model - t_next).item() / 1000.0
+            x_t = x_t - dt_norm * v_pred.float()
 
     def _cleanup():
         restore()
@@ -699,14 +722,16 @@ def attack_single_video(
     if target_condition_template is not None:
         with torch.no_grad():
             latent = model.tokenizer.encode(raw_padded.to(compute_dtype)).contiguous().float()
+            print(f"Latent Shape {latent.shape}")
         print("Computing spatial sim mask...")
         sim_masks = compute_sim_mask(
             model, latent, condition, target_condition_template, T_tok,
             num_attack_layers=cutoff_blocks,
             num_latent_conditional_frames=args.num_latent_conditional_frames,
-            noise_seed=0,
+            noise_seed=0
         )                                                                  
-        analyze_sim_masks(sim_masks, spatial_grid=27, save_dir= "sim_analysis")
+    #     analyze_sim_masks(sim_masks, spatial_grid=27, save_dir= "sim_analysis")
+    
 
     loss_fn = lambda x, y: compute_crossattn_loss(
         model, x, condition, T_tok,
@@ -724,6 +749,7 @@ def attack_single_video(
     if args.skip_latent:
         with torch.no_grad():
             latent = model.tokenizer.encode(raw_padded.to(compute_dtype)).contiguous().float()
+            # latent = torch.empty_like(latent).uniform_(-3, 3)
         x_adv = pgd(latent, 0, lambda x: x, loss_fn, args.steps, args.alpha, args.eps, args.num_latent_conditional_frames)
     else:
         x_adv = pgd(raw_padded, 0, lambda x: x, loss_fn, args.steps, args.alpha, args.eps, frames_to_extract,
