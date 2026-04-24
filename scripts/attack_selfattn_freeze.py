@@ -59,13 +59,13 @@ Usage (single video):
 
 Usage (batch):
     python cosmos-predict2.5/scripts/attack_selfattn_freeze.py \
-        --batch_path /mnt/ssd2/libero/eval_set/ \
+        --batch_path /mnt/ssd2/libero/libero_all_short/\
         --attack_num 10 \
         --resolution 432,432 \
         --num_latent_video_frames 9 \
         --num_latent_conditional_frames 2 \
-        --steps 100 --alpha 0.00392 --eps 0.0628 \
-        --num_attack_layers 14 --skip_latent
+        --steps 200 --alpha 0.00392 --eps 0.0828 \
+        --denoise_steps 4 --skip_latent --max_att
 """
 
 import argparse

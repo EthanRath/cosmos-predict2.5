@@ -425,19 +425,23 @@ def compute_crossattn_loss(model, x_padded, condition, T_tok, layer_start=0, lay
                            skip_latent=False, max_att=False, denoise_steps=1,
                            uncondition=None, guidance_scale=7.0,
                            target_condition=None, noise_seed=None,
-                           num_latent_conditional_frames=2, sim_masks=None):
+                           num_latent_conditional_frames=2, sim_masks=None,
+                           loss_type="cosine"):
     """
     Run `denoise_steps` Euler denoising steps and return the cross-attention loss.
 
-    Untargeted (target_condition=None):
-        L = mean_l ||S^(l)||_F^2 / (B*H)
+    loss_type="cosine"  (default)
+        Untargeted: L = mean_l ||A^(l)||_F^2 / (B*H)
+        Targeted  : L = 1 - cosine_similarity(flat(A_base * M), flat(A_target * M))
+                    where M is the optional per-layer spatial mask.
 
-    Targeted (target_condition provided):
-        At each denoising step, a no-grad pass with target_condition is run at
-        the *same* xt and with the *same* perturbed gt_frames as the base pass.
-        L = 1 - cosine_similarity(flat(S_base * M), flat(S_target * M))
-        where M is the optional per-layer spatial mask from compute_sim_mask.
-        When sim_masks is None the unweighted scores are used.
+    loss_type="l2"
+        Untargeted: L = mean_l ||A^(l)||_F^2 / (B*H)   (identical to cosine untargeted)
+        Targeted  : L = mean_l ||A_base^(l) - A_target^(l)||_F^2 / (B*H)
+                    Minimises the per-block Frobenius distance between the adv and
+                    target attention distributions.  More memory-efficient than cosine
+                    because the difference is reduced to a scalar per block without
+                    materialising large flat vectors.
     """
     compute_dtype = next(model.net.parameters()).dtype
 
@@ -550,18 +554,36 @@ def compute_crossattn_loss(model, x_padded, condition, T_tok, layer_start=0, lay
             detach_hook.remove()
 
     if target_cond_live is not None:
-        if sim_masks is not None:
-            # Weight each (B,T,S,N,H) score by its per-spatial mask (B,T,S,H),
-            # broadcast over the text-token dim N.
-            adv_vec = torch.cat([(s * m.unsqueeze(3)).flatten()
-                                  for s, m in zip(loss_terms, sim_masks)])
-            tgt_vec = torch.cat([(s * m.unsqueeze(3)).detach().flatten()
-                                  for s, m in zip(target_terms, sim_masks)])
+        if loss_type == "l2":
+            # Per-block ||A_base - A_target||_F^2 / (B*H).  The difference tensor
+            # is reduced to a scalar immediately so only one block's worth of
+            # activations is live at a time — much lower peak VRAM than cosine.
+            if sim_masks is not None:
+                loss = torch.stack([
+                    ((s - t.detach()) * m.unsqueeze(3)).pow(2).sum() / (s.shape[0] * s.shape[4])
+                    for s, t, m in zip(loss_terms, target_terms, sim_masks)
+                ]).mean()
+            else:
+                loss = torch.stack([
+                    (s - t.detach()).pow(2).sum() / (s.shape[0] * s.shape[4])
+                    for s, t in zip(loss_terms, target_terms)
+                ]).mean()
         else:
-            adv_vec = torch.cat([s.flatten() for s in loss_terms])
-            tgt_vec = torch.cat([s.detach().flatten() for s in target_terms])
-        cos_sim_val = F.cosine_similarity(adv_vec.unsqueeze(0), tgt_vec.unsqueeze(0)).squeeze()
-        loss = 1.0 - cos_sim_val
+            # cosine: build tgt_vec first, free target_terms, then build adv_vec.
+            # Each score tensor is (B, T, S_per_frame, N, H) fp32 — freeing
+            # target_terms before materialising adv_vec saves ~one list worth of VRAM.
+            if sim_masks is not None:
+                tgt_vec = torch.cat([(s * m.unsqueeze(3)).detach().flatten()
+                                      for s, m in zip(target_terms, sim_masks)])
+                del target_terms
+                adv_vec = torch.cat([(s * m.unsqueeze(3)).flatten()
+                                      for s, m in zip(loss_terms, sim_masks)])
+            else:
+                tgt_vec = torch.cat([s.detach().flatten() for s in target_terms])
+                del target_terms
+                adv_vec = torch.cat([s.flatten() for s in loss_terms])
+            del loss_terms
+            loss = 1.0 - F.cosine_similarity(adv_vec.unsqueeze(0), tgt_vec.unsqueeze(0)).squeeze()
     else:
         loss = torch.stack(
             [s.pow(2).sum() / (s.shape[0] * s.shape[4]) for s in loss_terms]
@@ -718,6 +740,12 @@ def attack_single_video(
     # ------------------------------------------------------------------
     # 7. PGD optimisation
     # ------------------------------------------------------------------
+    # Release any fragmented allocator cache before the gradient-connected
+    # forward passes start.  The condition-building and any no-grad encodes
+    # above may have left cached-but-freed blocks that prevent the large
+    # contiguous allocations the VAE encoder needs during backprop.
+    torch.cuda.empty_cache()
+
     print(f"\nStarting PGD optimisation "
           f"({'targeted' if target_condition_template is not None else 'untargeted'})...")
 
@@ -752,6 +780,7 @@ def attack_single_video(
         noise_seed=0 if target_condition_template is not None else None,
         num_latent_conditional_frames=args.num_latent_conditional_frames,
         sim_masks=sim_masks,
+        loss_type=args.loss_type,
     )
     if args.skip_latent:
         with torch.no_grad():
@@ -853,6 +882,14 @@ def main():
                         help="Optimise in latent space instead of pixel space.")
     parser.add_argument("--max_att", action="store_true",
                         help="Maximise cross-attention instead of minimising it.")
+    parser.add_argument("--loss_type", choices=["cosine", "l2"], default="cosine",
+                        help="Loss for the targeted attack.  "
+                             "'cosine' (default): minimise 1 - cosine_similarity between "
+                             "flattened adv and target attention vectors.  "
+                             "'l2': minimise mean_l ||A_base^(l) - A_target^(l)||_F^2 / (B*H); "
+                             "more memory-efficient and uses the same Frobenius-norm form as "
+                             "the self-attention freeze attack.  "
+                             "Has no effect in the untargeted case (both use Frobenius norm).")
     parser.add_argument("--denoise_steps", type=int, default=1,
                         help="Number of consecutive Euler denoising steps per PGD "
                              "gradient evaluation.  1 (default) = single forward pass "
