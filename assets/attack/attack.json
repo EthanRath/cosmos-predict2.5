@@ -1,6 +1,0 @@
-{
-    "inference_type": "video2world",
-    "name": "testk1-2",
-    "input_path": "k_1.mp4",
-    "prompt": "Use the franka robot arm to place the cookie box on top of the cabinet"
-}

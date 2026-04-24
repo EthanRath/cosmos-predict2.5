@@ -202,6 +202,4 @@ cython_debug/
 /results/
 /tmp/
 
-!assets/**/*.png
-!assets/**/*.jpg
-!assets/**/*.mp4
+assets/
