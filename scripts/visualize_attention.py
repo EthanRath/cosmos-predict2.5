@@ -30,18 +30,23 @@ Hooks block.cross_attn.compute_attention(q, k, v).  Post-softmax weights:
 
 Aggregated versions (averaged over all captured blocks) are also saved.
 
+--video_path also accepts .pt tensors saved by attack_selfattn_freeze.py or
+attack_crossattn.py.  The channel count auto-selects the path:
+  C=3  → pixel-space tensor, treated like a loaded video
+  C>3  → latent-space tensor, tokenizer.encode is bypassed via monkey-patch
+
 Usage
 -----
-    torchrun --nproc_per_node=2 cosmos-predict2.5/scripts/visualize_attention.py \\
-        --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \\
-        --prompt "Use the franka robot arm to pick up the black bowl" \\
-        --resolution 432,432 \\
-        --num_latent_video_frames 9 \\
-        --num_latent_conditional_frames 2 \\
-        --context_parallel_size 2 \\
-        --num_steps 36 \\
-        --blocks 0 7 13 \\
-        --out_dir attn_viz
+    torchrun --nproc_per_node=2 cosmos-predict2.5/scripts/visualize_attention.py \
+        --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \
+        --prompt "Use the franka robot arm to pick up the black bowl" \
+        --resolution 432,432 \
+        --num_latent_video_frames 9 \
+        --num_latent_conditional_frames 1 \
+        --context_parallel_size 1 \
+        --num_steps 36 \
+        --blocks 0 7 13 \
+        --out_dir attn_viz_2
 """
 
 import argparse
@@ -104,8 +109,8 @@ def load_and_preprocess_image(image_path, resolution, device="cpu"):
 # Attention capture hooks
 # ---------------------------------------------------------------------------
 
-def install_selfattn_hooks(net, captured_self, block_indices, capture_active, Sf,
-                           cp_group=None):
+def install_selfattn_hooks(net, captured_self, captured_self_spatial, block_indices,
+                           capture_active, Sf, cp_group=None):
     """
     Hook block.self_attn.compute_attention for each block in block_indices.
 
@@ -116,6 +121,13 @@ def install_selfattn_hooks(net, captured_self, block_indices, capture_active, Sf
          → Q_mean, K_mean: (B, T_local, H, D)
       3. All-gather across CP ranks → (B, T, H, D) on every rank
       4. Compute (B, T, T, H) frame-to-frame attention scores and softmax
+
+    Also computes a spatial attention map using the complementary approximation:
+      - Average Q and K over the T temporal frames → Q_sp, K_sp: (B, Sf, H, D)
+      - Gather across CP ranks (mean of shard-local temporal means)
+      - Compute (B, Sf, Sf, H) patch-to-patch attention and record attention
+        received per patch: sum over query dim → (B, Sf, H), stored as (Sf, H)
+        in captured_self_spatial.
 
     Only captures when capture_active[0] is True.
     """
@@ -144,9 +156,16 @@ def install_selfattn_hooks(net, captured_self, block_indices, capture_active, Sf
                         Sf_use  = S // T_local
                         scale   = D ** -0.5
 
-                        # Spatial mean: (B, T_local, H, D)
-                        q_m = q.float().reshape(B, T_local, Sf_use, H, D).mean(dim=2)
-                        k_m = k.float().reshape(B, T_local, Sf_use, H, D).mean(dim=2)
+                        qf = q.float().reshape(B, T_local, Sf_use, H, D)
+                        kf = k.float().reshape(B, T_local, Sf_use, H, D)
+
+                        # Spatial mean over patches → (B, T_local, H, D) for frame attn
+                        q_m = qf.mean(dim=2)
+                        k_m = kf.mean(dim=2)
+
+                        # Temporal mean over frames → (B, Sf_use, H, D) for spatial attn
+                        q_s = qf.mean(dim=1)
+                        k_s = kf.mean(dim=1)
 
                         # Gather across CP ranks so every rank has full (B, T, H, D)
                         if cp_group is not None and torch.distributed.is_initialized():
@@ -161,10 +180,29 @@ def install_selfattn_hooks(net, captured_self, block_indices, capture_active, Sf
                                 q_m = torch.cat(q_shards, dim=1)   # (B, T, H, D)
                                 k_m = torch.cat(k_shards, dim=1)
 
+                                # Gather spatial shard-local temporal means then average
+                                qs_shards = [torch.zeros_like(q_s) for _ in range(ws)]
+                                ks_shards = [torch.zeros_like(k_s) for _ in range(ws)]
+                                torch.distributed.all_gather(qs_shards, q_s.contiguous(),
+                                                             group=cp_group)
+                                torch.distributed.all_gather(ks_shards, k_s.contiguous(),
+                                                             group=cp_group)
+                                q_s = torch.stack(qs_shards, dim=0).mean(dim=0)  # (B, Sf, H, D)
+                                k_s = torch.stack(ks_shards, dim=0).mean(dim=0)
+
                         # Frame-to-frame scores: (B, T, T, H)
                         scores  = torch.einsum("bthd,bshd->btsh", q_m, k_m) * scale
                         weights = F.softmax(scores, dim=2)   # softmax over key frames
                         captured_self[block_idx] = weights.cpu()
+
+                        # Spatial patch-to-patch scores: (B, Sf, Sf, H)
+                        # scores_s[b, p, q, h] = query-patch p attending to key-patch q
+                        scores_s  = torch.einsum("bphd,bqhd->bpqh", q_s, k_s) * scale
+                        weights_s = F.softmax(scores_s, dim=2)   # softmax over key patches
+                        # Attention received by each patch: sum over query dim → (B, Sf, H)
+                        attn_rcvd = weights_s.sum(dim=1).cpu()   # (B, Sf, H)
+                        captured_self_spatial[block_idx] = attn_rcvd.mean(dim=0)  # (Sf, H)
+
                 return result
             return _wrapper
 
@@ -341,6 +379,62 @@ def plot_selfattn(captured_self, save_dir, suffix=""):
     print(f"  Saved self-attention plots to {save_dir / 'self_attn'}")
 
 
+def plot_selfattn_spatial(captured_self_spatial, spatial_grid, save_dir, suffix=""):
+    """
+    Plot spatial self-attention heatmaps.
+    captured_self_spatial values: (Sf, H) — attention received per patch per head,
+    computed from a temporal-mean approximation of Q/K.
+
+    Saves two files per block:
+      *_spatial      : (spatial_grid, spatial_grid) head-averaged heatmap
+      *_spatial_per_head : grid of H individual spatial heatmaps
+    """
+    import math
+    import matplotlib.pyplot as plt
+
+    save_dir = Path(save_dir)
+    (save_dir / "self_attn").mkdir(parents=True, exist_ok=True)
+
+    for block_idx, attn_rcvd in sorted(captured_self_spatial.items()):
+        # attn_rcvd: (Sf, H)
+        Sf, H = attn_rcvd.shape
+        g = spatial_grid if spatial_grid * spatial_grid == Sf else int(Sf ** 0.5)
+
+        # ---- head-averaged (spatial_grid, spatial_grid) ----
+        sp_np = attn_rcvd.float().mean(dim=1).numpy().reshape(g, g)
+
+        fig, ax = plt.subplots(figsize=(5, 5))
+        im = ax.imshow(sp_np, cmap="viridis", interpolation="nearest")
+        ax.set_title(f"Block {block_idx} — self-attn received per patch\n"
+                     f"({g}×{g} patches, head-mean, temporal-mean approx)")
+        plt.colorbar(im, ax=ax)
+        fig.tight_layout()
+        fig.savefig(save_dir / "self_attn" / f"block{block_idx:03d}_spatial{suffix}.png",
+                    dpi=100, bbox_inches="tight")
+        plt.close(fig)
+
+        # ---- per-head grid ----
+        cols = min(H, 8)
+        rows = math.ceil(H / cols)
+        fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
+        axes = [axes] if H == 1 else list(axes.flat)
+        for h_i in range(H):
+            ax = axes[h_i]
+            ax.imshow(attn_rcvd[:, h_i].float().numpy().reshape(g, g),
+                      cmap="viridis", interpolation="nearest")
+            ax.set_title(f"head {h_i}", fontsize=8)
+            ax.axis("off")
+        for h_i in range(H, len(axes)):
+            axes[h_i].set_visible(False)
+        fig.suptitle(f"Block {block_idx} — self-attn received per patch (per head)", fontsize=10)
+        fig.tight_layout()
+        fig.savefig(save_dir / "self_attn" / f"block{block_idx:03d}_spatial_per_head{suffix}.png",
+                    dpi=100, bbox_inches="tight")
+        plt.close(fig)
+
+    print(f"  Saved spatial self-attention plots to {save_dir / 'self_attn'}")
+
+
 def plot_crossattn(captured_cross, T_tok, spatial_grid, save_dir, suffix=""):
     import matplotlib.pyplot as plt
 
@@ -417,6 +511,30 @@ def plot_aggregated_selfattn(captured_self, save_dir, suffix=""):
     print(f"  Saved aggregated self-attention to {save_dir / f'self_attn_agg{suffix}.png'}")
 
 
+def plot_aggregated_selfattn_spatial(captured_self_spatial, spatial_grid, save_dir, suffix=""):
+    import matplotlib.pyplot as plt
+    if not captured_self_spatial:
+        return
+    save_dir = Path(save_dir)
+
+    sp_list = [v.float().mean(dim=1) for _, v in sorted(captured_self_spatial.items())]
+    agg_sp  = torch.stack(sp_list).mean(dim=0)   # (Sf,)
+
+    g = spatial_grid if spatial_grid * spatial_grid == agg_sp.shape[0] else int(agg_sp.shape[0] ** 0.5)
+    sp_grid = agg_sp.numpy().reshape(g, g)
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    im = ax.imshow(sp_grid, cmap="viridis", interpolation="nearest")
+    ax.set_title("All blocks aggregated — self-attn received per patch\n"
+                 "(head-mean, temporal-mean approx)")
+    plt.colorbar(im, ax=ax)
+    fig.tight_layout()
+    fig.savefig(save_dir / f"self_attn_spatial_agg{suffix}.png", dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved aggregated spatial self-attention to "
+          f"{save_dir / f'self_attn_spatial_agg{suffix}.png'}")
+
+
 def plot_aggregated_crossattn(captured_cross, T_tok, spatial_grid, save_dir, suffix=""):
     import matplotlib.pyplot as plt
     if not captured_cross:
@@ -454,7 +572,9 @@ def main():
 
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument("--video_path",
-                             help="Path to a conditioning video (.mp4)")
+                             help="Path to a conditioning video (.mp4) or a saved "
+                                  "attack tensor (.pt).  .pt files are auto-detected "
+                                  "as pixel-space (C=3) or latent-space (C>3).")
     input_group.add_argument("--image_path",
                              help="Path to a conditioning image (.jpg/.png)")
 
@@ -520,13 +640,14 @@ def main():
     state_t = model.config.state_t
 
     is_image         = args.image_path is not None
+    is_pt            = args.video_path is not None and Path(args.video_path).suffix == ".pt"
     num_cond_frames  = 1 if is_image else args.num_latent_conditional_frames
     T_lat            = min(args.num_latent_video_frames, state_t)
     req_pixel_frames = (T_lat - 1) * 4 + 1
     frames_to_extract = 1 if is_image else (num_cond_frames - 1) * 4 + 1
     T_tok            = T_lat
     n_blocks         = len(model.net.blocks)
-    spatial_grid     = H // 16   # patch size 16 → e.g. 432/16 = 27
+    spatial_grid     = H // 16   # patch size 16 → e.g. 432/16 = 27; overridden for .pt
 
     block_indices = (
         args.blocks if args.blocks is not None
@@ -556,26 +677,87 @@ def main():
     # ------------------------------------------------------------------
     # 3. Load and preprocess input
     # ------------------------------------------------------------------
-    if is_rank0:
-        src = args.image_path if is_image else args.video_path
-        print(f"\nLoading {'image' if is_image else 'video'}: {src}")
+    negative_prompt = args.negative_prompt or _DEFAULT_NEGATIVE_PROMPT
+    pt_latent       = None   # set to float32 GPU tensor for latent-space .pt files
 
     if is_image:
+        if is_rank0:
+            print(f"\nLoading image: {args.image_path}")
         raw_cond   = load_and_preprocess_image(args.image_path, [H, W], device="cpu")
         raw_padded = pad_video(raw_cond, frames_to_extract=1,
                                required_pixel_frames=req_pixel_frames)
+        if is_rank0:
+            print(f"  Padded input shape: {raw_padded.shape}")
+        video_bf16 = raw_padded.to(device=device, dtype=compute_dtype)
+
+    elif is_pt:
+        if is_rank0:
+            print(f"\nLoading .pt tensor: {args.video_path}")
+        raw_tensor = torch.load(args.video_path, map_location="cpu")
+        if raw_tensor.dim() != 5:
+            raise ValueError(
+                f"Expected 5-D tensor (B,C,T,H,W) in {args.video_path}, "
+                f"got shape {raw_tensor.shape}"
+            )
+        _, C_pt, T_pt, H_pt, W_pt = raw_tensor.shape
+
+        if C_pt == 3:
+            # Pixel-space .pt — pad/truncate to req_pixel_frames (same as mp4 path)
+            raw_tensor = raw_tensor.float()
+            _, _, T_px, H, W = raw_tensor.shape
+            if T_px < req_pixel_frames:
+                pad_n = req_pixel_frames - T_px
+                raw_tensor = torch.cat(
+                    [raw_tensor,
+                     raw_tensor[:, :, -1:, :, :].repeat(1, 1, pad_n, 1, 1)],
+                    dim=2,
+                )
+                if is_rank0:
+                    print(f"  Padded pixel .pt from T={T_px} to T={req_pixel_frames}")
+            elif T_px > req_pixel_frames:
+                raw_tensor = raw_tensor[:, :, :req_pixel_frames]
+                if is_rank0:
+                    print(f"  Truncated pixel .pt from T={T_px} to T={req_pixel_frames}")
+            raw_padded   = raw_tensor
+            T_tok        = T_lat
+            spatial_grid = H // 16
+            if is_rank0:
+                print(f"  Pixel-space .pt   shape: {raw_padded.shape}  "
+                      f"(T_tok={T_tok}, spatial_grid={spatial_grid}×{spatial_grid})")
+            video_bf16 = raw_padded.to(device=device, dtype=compute_dtype)
+        else:
+            # Latent-space .pt — bypass the tokenizer via model.encode monkey-patch
+            scf  = model.tokenizer.spatial_compression_factor   # e.g. 8
+            H    = H_pt * scf
+            W    = W_pt * scf
+            spatial_grid = H // 16
+            # Use min(T_pt, T_lat) frames — truncate if file is longer, keep as-is if shorter
+            T_tok = min(T_pt, T_lat)
+            if T_pt != T_tok:
+                raw_tensor = raw_tensor[:, :, :T_tok, :, :]
+                if is_rank0:
+                    print(f"  Truncated latent from T={T_pt} to T={T_tok}")
+            pt_latent  = raw_tensor.float().to(device=device)
+            # Dummy pixel video sized to match T_tok (for T5/conditioning metadata only)
+            T_pixel    = (T_tok - 1) * 4 + 1
+            video_bf16 = torch.zeros(
+                1, 3, T_pixel, H, W, device=device, dtype=compute_dtype
+            )
+            if is_rank0:
+                print(f"  Latent-space .pt  shape: {pt_latent.shape}  "
+                      f"(derived pixel: {H}×{W}, spatial_grid={spatial_grid}×{spatial_grid})")
+
     else:
+        if is_rank0:
+            print(f"\nLoading video: {args.video_path}")
         video_uint8 = load_and_preprocess_video(
             str(args.video_path), [H, W], frames_to_extract
         )
         raw_cond   = normalize_video(video_uint8, device="cpu")
         raw_padded = pad_video(raw_cond, frames_to_extract, req_pixel_frames)
-
-    if is_rank0:
-        print(f"  Padded input shape: {raw_padded.shape}")
-
-    video_bf16      = raw_padded.to(device=device, dtype=compute_dtype)*0
-    negative_prompt = args.negative_prompt or _DEFAULT_NEGATIVE_PROMPT
+        if is_rank0:
+            print(f"  Padded input shape: {raw_padded.shape}")
+        video_bf16 = raw_padded.to(device=device, dtype=compute_dtype)
 
     data_batch = inference._get_data_batch_input(
         video=video_bf16,
@@ -621,9 +803,10 @@ def main():
     # Total = 2 * num_steps calls.  We capture only on the final cond pass
     # (call number 2*num_steps - 1).
     # ------------------------------------------------------------------
-    capture_active  = [False]
-    captured_self   = {}
-    captured_cross  = {}
+    capture_active       = [False]
+    captured_self        = {}
+    captured_self_spatial = {}
+    captured_cross       = {}
 
     # Track denoise calls to identify the final cond pass
     call_counter        = [0]
@@ -652,8 +835,8 @@ def main():
     Sf = spatial_grid * spatial_grid
 
     restore_self = (
-        install_selfattn_hooks(model.net, captured_self, block_indices,
-                               capture_active, Sf, cp_group=cp_group)
+        install_selfattn_hooks(model.net, captured_self, captured_self_spatial,
+                               block_indices, capture_active, Sf, cp_group=cp_group)
         if do_self else (lambda: None)
     )
     restore_cross = (
@@ -673,20 +856,29 @@ def main():
     else:
         generate_fn = model.generate_samples_from_batch
 
-    with torch.no_grad():
-        sample = generate_fn(
-            data_batch,
-            n_sample=1,
-            guidance=args.guidance,
-            seed=args.seed,
-            is_negative_prompt=True,
-            num_steps=args.num_steps,
-        )
+    generate_kwargs = dict(
+        n_sample=1,
+        guidance=args.guidance,
+        seed=args.seed,
+        is_negative_prompt=True,
+        num_steps=args.num_steps,
+    )
+    if pt_latent is not None:
+        # Bypass tokenizer.encode — return the pre-computed latent directly.
+        # Assigning to the instance shadows the class method; del restores it.
+        model.encode = lambda state: pt_latent
+        generate_kwargs["state_shape"] = list(pt_latent.shape[1:])
 
-    # Restore hooks and denoise
-    restore_self()
-    restore_cross()
-    del model.denoise   # removes instance attribute, restores class method
+    try:
+        with torch.no_grad():
+            sample = generate_fn(data_batch, **generate_kwargs)
+    finally:
+        # Restore hooks and denoise regardless of exceptions
+        restore_self()
+        restore_cross()
+        del model.denoise   # removes instance attribute, restores class method
+        if pt_latent is not None and "encode" in model.__dict__:
+            del model.encode
 
     if is_rank0:
         print(f"  Captured self-attn  : {len(captured_self)} blocks")
@@ -738,10 +930,16 @@ def main():
 
             if captured_self:
                 for block_idx, w in sorted(captured_self.items()):
-                    B, T, _, H = w.shape
-                    print(f"  [self  block {block_idx:3d}]  (B={B}, T={T}, T={T}, H={H})")
+                    B, T, _, Hn = w.shape
+                    sp = captured_self_spatial.get(block_idx)
+                    sp_str = f"  spatial: (Sf={sp.shape[0]}, H={sp.shape[1]})" if sp is not None else ""
+                    print(f"  [self  block {block_idx:3d}]  (B={B}, T={T}, T={T}, H={Hn}){sp_str}")
                 plot_selfattn(captured_self, out_dir, suffix)
                 plot_aggregated_selfattn(captured_self, out_dir, suffix)
+                if captured_self_spatial:
+                    plot_selfattn_spatial(captured_self_spatial, spatial_grid, out_dir, suffix)
+                    plot_aggregated_selfattn_spatial(captured_self_spatial, spatial_grid,
+                                                     out_dir, suffix)
 
             if captured_cross:
                 for block_idx, w in sorted(captured_cross.items()):
