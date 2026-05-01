@@ -102,7 +102,7 @@ from cosmos_predict2._src.predict2.models.text2world_model_rectified_flow import
     IS_PREPROCESSED_KEY,
 )
 import cosmos_predict2._src.predict2.inference.get_t5_emb as _t5_mod  # noqa: E402
-from probing.test_vae_encoder import load_and_preprocess_video, normalize_video  # noqa: E402
+from probing.test_vae_encoder import load_and_preprocess_video, normalize_video, resize_input  # noqa: E402
 from attack.white_box import pgd
 from attack.eval_wm import eval, eval_latent
 from attack.shared_config import (
@@ -125,6 +125,24 @@ def pad_video(video, frames_to_extract, required_pixel_frames):
             [context, context[:, :, -1:, :, :].repeat(1, 1, padding, 1, 1)], dim=2
         )
     return context
+
+
+def load_full_video(video_path, resolution):
+    """Load all frames of a video and resize to resolution.
+    Returns (1, C, T, H, W) uint8 tensor.
+    """
+    from cosmos_predict2._src.imaginaire.utils.easy_io import easy_io
+
+    video_frames, video_metadata = easy_io.load(str(video_path))
+    print(f"Loaded full video: shape={video_frames.shape}, metadata={video_metadata}")
+
+    video_tensor = torch.from_numpy(video_frames).float() / 255.0  # (T, H, W, C)
+    video_tensor = video_tensor.permute(3, 0, 1, 2)                # (C, T, H, W)
+    video_tensor = video_tensor.permute(1, 0, 2, 3)                # (T, C, H, W)
+    video_tensor = (video_tensor * 255.0).to(torch.uint8)
+    video_tensor = resize_input(video_tensor, resolution)           # (T, C, H, W) uint8
+    video_tensor = video_tensor.unsqueeze(0).permute(0, 2, 1, 3, 4)  # (1, C, T, H, W)
+    return video_tensor
 
 
 # ---------------------------------------------------------------------------
@@ -624,13 +642,20 @@ def attack_single_video(
                 _t5_mod.cosmos_encoder.text_encoder.to(device).eval()
 
     print(f"\nLoading video : {video_path}")
-    video_uint8 = load_and_preprocess_video(
-        str(video_path), [H, W], frames_to_extract
-    )
-    raw_cond = normalize_video(video_uint8, device=device)
-    print(f"Conditioning frames shape: {raw_cond.shape}")
-
-    raw_padded = pad_video(raw_cond, frames_to_extract, required_pixel_frames)
+    if args.extend:
+        full_video_uint8 = load_full_video(str(video_path), [H, W])
+        raw_full = normalize_video(full_video_uint8, device=device)
+        args._extend_full_video = raw_full.cpu()  # stored on CPU; forwarded to eval for saving
+        print(f"Full video shape         : {raw_full.shape}")
+        raw_padded = pad_video(raw_full, frames_to_extract, required_pixel_frames)
+    else:
+        video_uint8 = load_and_preprocess_video(
+            str(video_path), [H, W], frames_to_extract
+        )
+        raw_cond = normalize_video(video_uint8, device=device)
+        args._extend_full_video = None
+        print(f"Conditioning frames shape: {raw_cond.shape}")
+        raw_padded = pad_video(raw_cond, frames_to_extract, required_pixel_frames)
     print(f"Padded video shape       : {raw_padded.shape}")
 
     # ------------------------------------------------------------------
@@ -878,6 +903,10 @@ def main():
     parser.add_argument("--context_parallel_size",   type=int, default=1)
     parser.add_argument("--config_file",
                         default="cosmos_predict2/_src/predict2/configs/video2world/config.py")
+    parser.add_argument("--extend", action="store_true",
+                        help="Extension mode: load all frames of the input video and use the "
+                             "final frames as conditioning context.  The saved output video "
+                             "includes all original frames followed by the generated extension.")
     parser.add_argument("--skip_latent", action="store_true",
                         help="Optimise in latent space instead of pixel space.")
     parser.add_argument("--max_att", action="store_true",
