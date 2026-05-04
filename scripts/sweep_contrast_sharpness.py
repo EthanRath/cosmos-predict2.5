@@ -68,32 +68,40 @@ from attack.shared_config import vae_path                                       
 # Image-space transforms  (operate on float [-1, 1] tensors)
 # ---------------------------------------------------------------------------
 
-def apply_contrast(video: torch.Tensor, factor: float) -> torch.Tensor:
-    """
-    Adjust contrast of each frame independently.
-    video: (1, C, T, H, W) float32 in [-1, 1].
-    factor=1.0 -> no change; factor=0.0 -> grey frame.
-    """
-    v01 = (video.clamp(-1, 1) + 1) / 2.0
-    B, C, T, H, W = v01.shape
+def _per_frame(video: torch.Tensor, fn) -> torch.Tensor:
+    """Apply a (C, H, W) -> (C, H, W) torchvision function to every frame."""
+    v01 = (video.clamp(-1, 1) + 1) / 2.0           # [-1,1] -> [0,1]
     frames = v01[0].permute(1, 0, 2, 3)            # (T, C, H, W)
-    out = torch.stack([TF.adjust_contrast(f, factor) for f in frames])
-    out = out.permute(1, 0, 2, 3).unsqueeze(0)      # (1, C, T, H, W)
-    return out * 2.0 - 1.0
+    out = torch.stack([fn(f) for f in frames])
+    return out.permute(1, 0, 2, 3).unsqueeze(0) * 2.0 - 1.0
+
+
+def apply_contrast(video: torch.Tensor, factor: float) -> torch.Tensor:
+    """factor=1.0 -> unchanged; factor=0.0 -> grey."""
+    return _per_frame(video, lambda f: TF.adjust_contrast(f, factor))
 
 
 def apply_sharpness(video: torch.Tensor, factor: float) -> torch.Tensor:
-    """
-    Adjust sharpness of each frame independently.
-    video: (1, C, T, H, W) float32 in [-1, 1].
-    factor=1.0 -> no change; factor=0.0 -> blurred.
-    """
-    v01 = (video.clamp(-1, 1) + 1) / 2.0
-    B, C, T, H, W = v01.shape
-    frames = v01[0].permute(1, 0, 2, 3)            # (T, C, H, W)
-    out = torch.stack([TF.adjust_sharpness(f, factor) for f in frames])
-    out = out.permute(1, 0, 2, 3).unsqueeze(0)
-    return out * 2.0 - 1.0
+    """factor=1.0 -> unchanged; factor=0.0 -> blurred; factor>1 -> over-sharpened."""
+    return _per_frame(video, lambda f: TF.adjust_sharpness(f, factor))
+
+
+def apply_hue(video: torch.Tensor, factor: float) -> torch.Tensor:
+    """factor=0.0 -> unchanged; valid range [-0.5, 0.5]."""
+    return _per_frame(video, lambda f: TF.adjust_hue(f, factor))
+
+
+def apply_saturation(video: torch.Tensor, factor: float) -> torch.Tensor:
+    """factor=1.0 -> unchanged; factor=0.0 -> greyscale; factor>1 -> over-saturated."""
+    return _per_frame(video, lambda f: TF.adjust_saturation(f, factor))
+
+
+TRANSFORMS = {
+    "contrast":   apply_contrast,
+    "sharpness":  apply_sharpness,
+    "hue":        apply_hue,
+    "saturation": apply_saturation,
+}
 
 
 def to_uint8_frames(t: torch.Tensor) -> torch.Tensor:
@@ -273,15 +281,20 @@ def main():
         "--num_latent_conditional_frames", type=int, default=2,
         help="Number of latent conditioning frames (default: 2)",
     )
+    valid_axes = sorted(TRANSFORMS.keys())
     parser.add_argument(
-        "--contrast_values", type=float, nargs="+",
-        default=[0.2, 0.5, 1.0],
-        help="Contrast factors to sweep (1.0 = original)",
+        "--sweep_axes", nargs=2, default=["contrast", "sharpness"],
+        metavar=("AXIS1", "AXIS2"),
+        help=f"Two image properties to sweep. Choices: {valid_axes}. "
+             "Default: contrast sharpness",
     )
     parser.add_argument(
-        "--sharpness_values", type=float, nargs="+",
-        default=[0.0, 0.5, 1.0],
-        help="Sharpness factors to sweep (1.0 = original)",
+        "--axis1_values", type=float, nargs="+", default=[0.2, 0.5, 1.0],
+        help="Values for AXIS1 (default: 0.2 0.5 1.0)",
+    )
+    parser.add_argument(
+        "--axis2_values", type=float, nargs="+", default=[0.0, 0.5, 1.0],
+        help="Values for AXIS2 (default: 0.0 0.5 1.0)",
     )
     parser.add_argument(
         "--attack_layers_start", type=int, default=0,
@@ -303,6 +316,13 @@ def main():
     if not args.prompt and not args.target_prompt:
         parser.error("At least one of --prompt or --target_prompt must be provided.")
 
+    for ax in args.sweep_axes:
+        if ax not in TRANSFORMS:
+            parser.error(f"Unknown sweep axis '{ax}'. Choose from: {sorted(TRANSFORMS)}")
+
+    axis1, axis2 = args.sweep_axes
+    fn1, fn2 = TRANSFORMS[axis1], TRANSFORMS[axis2]
+
     device = "cuda"
     num_pixel_frames = (args.num_latent_video_frames - 1) * 4 + 1
     T_tok = args.num_latent_video_frames   # latent temporal dimension used by DiT
@@ -310,8 +330,8 @@ def main():
     print(f"Resolution      : {args.resolution}")
     print(f"Latent T frames : {args.num_latent_video_frames}")
     print(f"Pixel T frames  : {num_pixel_frames}")
-    print(f"Contrast sweep  : {args.contrast_values}")
-    print(f"Sharpness sweep : {args.sharpness_values}")
+    print(f"Axis 1 ({axis1:<10}): {args.axis1_values}")
+    print(f"Axis 2 ({axis2:<10}): {args.axis2_values}")
     if args.target_prompt:
         print(f"Target prompt   : {args.target_prompt}")
         print(f"Denoise steps   : {args.denoise_steps}")
@@ -383,18 +403,18 @@ def main():
     # ------------------------------------------------------------------
     # 5. Sweep
     # ------------------------------------------------------------------
-    grid = list(itertools.product(args.contrast_values, args.sharpness_values))
+    grid = list(itertools.product(args.axis1_values, args.axis2_values))
     print(f"\nTotal sweep points : {len(grid)}")
 
-    # (contrast, sharpness) -> l2_loss float
+    # (val1, val2) -> l2_loss float
     loss_results: dict[tuple, float] = {}
 
-    for i, (contrast, sharpness) in enumerate(grid):
-        label = f"c{contrast:.2f}_s{sharpness:.2f}"
-        print(f"\n[{i+1}/{len(grid)}] contrast={contrast:.2f}  sharpness={sharpness:.2f}")
+    for i, (val1, val2) in enumerate(grid):
+        label = f"{axis1[:3]}{val1:.2f}_{axis2[:3]}{val2:.2f}"
+        print(f"\n[{i+1}/{len(grid)}] {axis1}={val1:.2f}  {axis2}={val2:.2f}")
 
-        x_mod = apply_contrast(raw_state, contrast)
-        x_mod = apply_sharpness(x_mod, sharpness)
+        x_mod = fn1(raw_state, val1)
+        x_mod = fn2(x_mod, val2)
         x_mod = x_mod.clamp(-1, 1)
 
         cell_dir = out_root / label
@@ -416,7 +436,7 @@ def main():
                 layer_end=args.attack_layers_end,
                 denoise_steps=args.denoise_steps,
             )
-            loss_results[(contrast, sharpness)] = loss_val
+            loss_results[(val1, val2)] = loss_val
             print(f"  L2 loss : {loss_val:.6f}")
 
         # -- Full diffusion generation --
@@ -439,18 +459,22 @@ def main():
     # 6. Summary table
     # ------------------------------------------------------------------
     if loss_results:
-        contrasts  = sorted(set(c for c, _ in loss_results))
-        sharpnesses = sorted(set(s for _, s in loss_results))
+        vals1 = sorted(set(v for v, _ in loss_results))
+        vals2 = sorted(set(v for _, v in loss_results))
 
-        header = f"{'':>8s} | " + " | ".join(f"sharp={s:.2f}" for s in sharpnesses)
+        col_w  = max(len(f"{axis2}={v:.2f}") for v in vals2)
+        header = f"{axis1:>12s} | " + " | ".join(
+            f"{axis2}={v:.2f}".rjust(col_w) for v in vals2
+        )
         sep    = "-" * len(header)
         lines  = [
-            "L2 cross-attention loss  (lower = more susceptible to targeted attack)",
+            f"L2 cross-attention loss  [{axis1} × {axis2}]  "
+            "(lower = more susceptible to targeted attack)",
             sep, header, sep,
         ]
-        for c in contrasts:
-            row = f"cont={c:.2f} | " + " | ".join(
-                f"{loss_results[(c, s)]:>12.6f}" for s in sharpnesses
+        for v1 in vals1:
+            row = f"{axis1}={v1:.2f}".rjust(12) + " | " + " | ".join(
+                f"{loss_results[(v1, v2)]:>{col_w}.6f}" for v2 in vals2
             )
             lines.append(row)
         lines.append(sep)
@@ -476,25 +500,23 @@ if __name__ == "__main__":
 
 
 """
-# Full generation + loss (default denoise_steps=36):
+# Contrast × sharpness, full generation + loss:
 python cosmos-predict2.5/scripts/sweep_contrast_sharpness.py \
     --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \
     --prompt "robot arm picks up a block" \
     --target_prompt "robot arm knocks over the block" \
-    --resolution 432 432 \
-    --num_latent_video_frames 4 \
-    --contrast_values 0.2 0.5 1.0 \
-    --sharpness_values 0.0 0.5 1.0 \
-    --attack_layers_end 13
+    --sweep_axes contrast sharpness \
+    --axis1_values 0.2 0.5 1.0 \
+    --axis2_values 0.0 0.5 1.0 \
+    --resolution 432 432 --num_latent_video_frames 4 --attack_layers_end 13
 
-# Loss only, fast (denoise_steps < 36):
+# Hue × saturation, loss only (fast):
 python cosmos-predict2.5/scripts/sweep_contrast_sharpness.py \
     --video_path cosmos-predict2.5/assets/attack/k_1.mp4 \
     --target_prompt "robot arm knocks over the block" \
-    --resolution 432 432 \
-    --num_latent_video_frames 4 \
-    --contrast_values 0.2 0.5 1.0 \
-    --sharpness_values 0.0 0.5 1.0 \
-    --denoise_steps 1 \
-    --attack_layers_end 13
+    --sweep_axes hue saturation \
+    --axis1_values -0.3 0.0 0.3 \
+    --axis2_values 0.0 0.5 1.0 2.0 \
+    --resolution 432 432 --num_latent_video_frames 4 \
+    --denoise_steps 1 --attack_layers_end 13
 """
