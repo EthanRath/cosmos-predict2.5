@@ -919,7 +919,7 @@ def main():
                         help="Optimise in latent space instead of pixel space.")
     parser.add_argument("--max_att", action="store_true",
                         help="Maximise cross-attention instead of minimising it.")
-    parser.add_argument("--loss_type", choices=["cosine", "l2"], default="cosine",
+    parser.add_argument("--loss_type", choices=["cosine", "l2", "kl"], default="cosine",
                         help="Loss for the targeted attack.  "
                              "'cosine' (default): minimise 1 - cosine_similarity between "
                              "flattened adv and target attention vectors.  "
