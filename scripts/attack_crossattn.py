@@ -790,14 +790,14 @@ def attack_single_video(
             latent = model.tokenizer.encode(raw_padded.to(compute_dtype)).contiguous().float()
             print(f"Latent Shape {latent.shape}")
         # print("Computing spatial sim mask...")
-        sim_masks = compute_sim_mask(
-            model, latent, condition, target_condition_template, T_tok,
-            layer_start=layer_start,
-            layer_end=layer_end,
-            num_latent_conditional_frames=args.num_latent_conditional_frames,
-            noise_seed=0
-        )                                                                  
-        analyze_sim_masks(sim_masks, spatial_grid=27, save_dir= "sim_analysis")
+        # sim_masks = compute_sim_mask(
+        #     model, latent, condition, target_condition_template, T_tok,
+        #     layer_start=layer_start,
+        #     layer_end=layer_end,
+        #     num_latent_conditional_frames=args.num_latent_conditional_frames,
+        #     noise_seed=0
+        # )                                                                  
+        # analyze_sim_masks(sim_masks, spatial_grid=27, save_dir= "sim_analysis")
     
 
     loss_fn = lambda x, y: compute_crossattn_loss(
