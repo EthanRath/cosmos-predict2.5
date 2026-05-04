@@ -313,7 +313,6 @@ def compute_sim_mask(model, latent, condition, target_condition, T_tok,
 
     # cosine similarity over text-token dim (N) → (B, T, S, H)
     # 1 - sim: high where the two prompts differ most
-    print("NEW")
     masks = [
         (1.0 - F.cosine_similarity(s_true, s_tgt, dim=3)).detach()
         for s_true, s_tgt in zip(true_means, tgt_means)
@@ -586,6 +585,15 @@ def compute_crossattn_loss(model, x_padded, condition, T_tok, layer_start=0, lay
                     (s - t.detach()).pow(2).sum() / (s.shape[0] * s.shape[4])
                     for s, t in zip(loss_terms, target_terms)
                 ]).mean()
+        elif loss_type == "kl":
+                loss = torch.stack([
+                    F.kl_div(
+                        s.log(),           # predicted log-probs (adv image, true prompt)
+                        t.detach(),        # target probs (true image, target prompt)
+                        reduction='sum'
+                    ) / (s.shape[0] * s.shape[4])
+                    for s, t in zip(loss_terms, target_terms)
+                ]).mean()
         else:
             # cosine: build tgt_vec first, free target_terms, then build adv_vec.
             # Each score tensor is (B, T, S_per_frame, N, H) fp32 — freeing
@@ -782,14 +790,14 @@ def attack_single_video(
             latent = model.tokenizer.encode(raw_padded.to(compute_dtype)).contiguous().float()
             print(f"Latent Shape {latent.shape}")
         # print("Computing spatial sim mask...")
-        # sim_masks = compute_sim_mask(
-        #     model, latent, condition, target_condition_template, T_tok,
-        #     layer_start=layer_start,
-        #     layer_end=layer_end,
-        #     num_latent_conditional_frames=args.num_latent_conditional_frames,
-        #     noise_seed=0
-        # )                                                                  
-        # analyze_sim_masks(sim_masks, spatial_grid=27, save_dir= "sim_analysis")
+        sim_masks = compute_sim_mask(
+            model, latent, condition, target_condition_template, T_tok,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            num_latent_conditional_frames=args.num_latent_conditional_frames,
+            noise_seed=0
+        )                                                                  
+        analyze_sim_masks(sim_masks, spatial_grid=27, save_dir= "sim_analysis")
     
 
     loss_fn = lambda x, y: compute_crossattn_loss(
