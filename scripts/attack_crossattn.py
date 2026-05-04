@@ -790,14 +790,15 @@ def attack_single_video(
             latent = model.tokenizer.encode(raw_padded.to(compute_dtype)).contiguous().float()
             print(f"Latent Shape {latent.shape}")
         # print("Computing spatial sim mask...")
-        # sim_masks = compute_sim_mask(
-        #     model, latent, condition, target_condition_template, T_tok,
-        #     layer_start=layer_start,
-        #     layer_end=layer_end,
-        #     num_latent_conditional_frames=args.num_latent_conditional_frames,
-        #     noise_seed=0
-        # )                                                                  
-        # analyze_sim_masks(sim_masks, spatial_grid=27, save_dir= "sim_analysis")
+        if args.mask:
+            sim_masks = compute_sim_mask(
+                model, latent, condition, target_condition_template, T_tok,
+                layer_start=layer_start,
+                layer_end=layer_end,
+                num_latent_conditional_frames=args.num_latent_conditional_frames,
+                noise_seed=0
+            )                                                                  
+            analyze_sim_masks(sim_masks, spatial_grid=27, save_dir= "sim_analysis")
     
 
     loss_fn = lambda x, y: compute_crossattn_loss(
@@ -860,7 +861,7 @@ def main():
                              help="Path to a batch directory containing videos/ and "
                                   "metas/ subfolders.  Each <name>.mp4 in videos/ must "
                                   "have a matching <name>.txt prompt in metas/.")
-
+    parser.add_argument("--mask", action = "store_true")
     parser.add_argument("--prompt", default=None,
                         help="Text prompt (required with --video_path)")
     parser.add_argument("--target_prompt", default=None,
