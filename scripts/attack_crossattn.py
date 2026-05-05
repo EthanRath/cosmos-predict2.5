@@ -103,7 +103,7 @@ from cosmos_predict2._src.predict2.models.text2world_model_rectified_flow import
 )
 import cosmos_predict2._src.predict2.inference.get_t5_emb as _t5_mod  # noqa: E402
 from probing.test_vae_encoder import load_and_preprocess_video, normalize_video, resize_input  # noqa: E402
-from attack.white_box import pgd
+from attack.white_box import pgd, lab_freq_pgd
 from attack.eval_wm import eval, eval_latent
 from attack.shared_config import (
     ckpt_path, experiment_name, config_file
@@ -875,7 +875,19 @@ def attack_single_video(
         loss_type=args.loss_type,
         dit_device=dit_device if vae_device != dit_device else None,
     )
-    if args.skip_latent:
+    if getattr(args, "lf_attack", False):
+        if args.skip_latent:
+            raise ValueError("--lf_attack requires pixel-space optimisation and is incompatible with --skip_latent")
+        x_adv = lab_freq_pgd(
+            raw_padded, 0, lambda x: x, loss_fn,
+            args.steps, args.alpha, args.eps,
+            frames_to_extract,
+            pixel_min=-1.0, pixel_max=1.0,
+            freq_cutoff=args.freq_cutoff,
+            lab_budget_L=args.lab_budget_L,
+            lab_budget_ab=args.lab_budget_ab,
+        )
+    elif args.skip_latent:
         with torch.no_grad():
             latent = model.tokenizer.encode(raw_padded.to(compute_dtype)).contiguous().float()
             # latent = torch.empty_like(latent).uniform_(-3, 3)
@@ -998,6 +1010,20 @@ def main():
                              "Only applied when --denoise_steps > 1. "
                              "Matches the default used during normal inference. "
                              "Default: 7.0.")
+    parser.add_argument("--lf_attack", action="store_true",
+                        help="Use the LAB+Frequency space PGD attack instead of standard "
+                             "pixel-space PGD.  Optimises a low-frequency complex delta in "
+                             "the frequency domain of the LAB image.  Incompatible with "
+                             "--skip_latent.")
+    parser.add_argument("--freq_cutoff", type=float, default=0.1,
+                        help="Fraction of low-frequency coefficients to perturb in the "
+                             "LAB+Frequency attack.  Default: 0.1.")
+    parser.add_argument("--lab_budget_L", type=float, default=5.0,
+                        help="Maximum L* channel perturbation (LAB units) for --lf_attack.  "
+                             "Default: 5.0.")
+    parser.add_argument("--lab_budget_ab", type=float, default=20.0,
+                        help="Maximum a*, b* channel perturbation (LAB units) for --lf_attack.  "
+                             "Default: 20.0.")
     parser.add_argument(
         "--split_gpus", action="store_true",
         help="Place the VAE encoder on cuda:0 and the DiT on cuda:1.  Gradient flows "
@@ -1131,6 +1157,26 @@ def main():
         print("\nEvaluating Diffusion")
         args.adv_path = out_dir
         args.prompt   = prompt
+
+        # ------------------------------------------------------------------
+        # Restore single-GPU state before evaluation.
+        # During the attack, torch.cuda.set_device(dit_device) was called and
+        # model.net was placed on dit_device.  eval_wm.py uses
+        # torch.cuda.current_device() to decide where to put tensors, so we
+        # must reset the default device and move everything back to vae_device
+        # before running inference.  For batch mode, attack_single_video will
+        # re-apply the split at the start of the next iteration.
+        # ------------------------------------------------------------------
+        if vae_device != dit_device:
+            torch.cuda.set_device(vae_device)
+            model.net = model.net.to(vae_device)
+            if hasattr(model, "conditioner") and model.conditioner is not None:
+                model.conditioner = model.conditioner.to(vae_device)
+            model.tensor_kwargs["device"] = vae_device
+            if hasattr(model, "tensor_kwargs_fp32"):
+                model.tensor_kwargs_fp32["device"] = vae_device
+            torch.cuda.empty_cache()
+
         if args.skip_latent:
             eval_latent(inference, x_adv, args, out_dir / base_name)
         else:
