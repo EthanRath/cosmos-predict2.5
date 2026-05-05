@@ -110,6 +110,20 @@ from attack.shared_config import (
 )
 
 # ---------------------------------------------------------------------------
+# Device helpers
+# ---------------------------------------------------------------------------
+
+def _move_condition_to_device(condition, device):
+    """Move all tensor attributes of a frozen condition dataclass to `device`.
+    Uses object.__setattr__ to bypass the frozen-dataclass restriction."""
+    for attr in vars(condition):
+        val = getattr(condition, attr)
+        if isinstance(val, torch.Tensor):
+            object.__setattr__(condition, attr, val.to(device))
+    return condition
+
+
+# ---------------------------------------------------------------------------
 # Video padding
 # ---------------------------------------------------------------------------
 
@@ -788,6 +802,16 @@ def attack_single_video(
         tgt_dict['crossattn_emb'] = target_data_batch['t5_text_embeddings']
         target_condition_template = type(condition)(**tgt_dict)
         # edit_for_inference was already applied to condition (which we copied)
+
+    # When split_gpus is active, _get_data_batch_input moves all float tensors
+    # to cuda:0 via .cuda(), but the DiT lives on dit_device.  Explicitly move
+    # every tensor attribute of each condition object to dit_device so that
+    # model.denoise() (which calls condition.to_dict()) sees a consistent device.
+    if vae_device != dit_device:
+        _move_condition_to_device(condition, dit_device)
+        _move_condition_to_device(uncondition, dit_device)
+        if target_condition_template is not None:
+            _move_condition_to_device(target_condition_template, dit_device)
 
     # ------------------------------------------------------------------
     # 7. PGD optimisation
