@@ -880,9 +880,8 @@ def attack_single_video(
             raise ValueError("--lf_attack requires pixel-space optimisation and is incompatible with --skip_latent")
         x_adv = lab_freq_pgd(
             raw_padded, 0, lambda x: x, loss_fn,
-            args.steps, args.alpha, args.eps,
+            args.steps, args.alpha,
             frames_to_extract,
-            pixel_min=-1.0, pixel_max=1.0,
             freq_cutoff=args.freq_cutoff,
             lab_budget_L=args.lab_budget_L,
             lab_budget_ab=args.lab_budget_ab,
