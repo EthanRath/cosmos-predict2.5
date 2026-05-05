@@ -476,6 +476,13 @@ def compute_crossattn_loss(model, x_padded, condition, T_tok, layer_start=0, lay
     """
     compute_dtype = next(model.net.parameters()).dtype
 
+    # Ensure the default CUDA device is dit_device for the entire loss computation.
+    # TE modules (e.g. RMSNorm) use torch.cuda.current_device() to allocate internal
+    # buffers; without this the buffers land on cuda:0 while model weights are on
+    # dit_device, causing a device mismatch in the first block forward pass.
+    if dit_device is not None:
+        torch.cuda.set_device(dit_device)
+
     if skip_latent:
         latent = x_padded
     else:
@@ -752,6 +759,12 @@ def attack_single_video(
         model.tensor_kwargs["device"] = dit_device
         if hasattr(model, "tensor_kwargs_fp32"):
             model.tensor_kwargs_fp32["device"] = dit_device
+        # Set the default CUDA device to dit_device.  Transformer Engine modules
+        # (e.g. RMSNorm used in t_embedding_norm) call torch.cuda.current_device()
+        # internally to create temporary tensors.  Without this, those tensors land
+        # on cuda:0 even though model.net lives on dit_device, causing device
+        # mismatch errors in the first DiT block forward pass.
+        torch.cuda.set_device(dit_device)
 
     # ------------------------------------------------------------------
     # 5. Freeze model parameters / enable VAE gradient
