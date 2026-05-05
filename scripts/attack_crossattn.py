@@ -443,7 +443,7 @@ def compute_crossattn_loss(model, x_padded, condition, T_tok, layer_start=0, lay
                            uncondition=None, guidance_scale=7.0,
                            target_condition=None, noise_seed=None,
                            num_latent_conditional_frames=2, sim_masks=None,
-                           loss_type="cosine"):
+                           loss_type="cosine", dit_device=None):
     """
     Run `denoise_steps` Euler denoising steps and return the cross-attention loss.
 
@@ -466,6 +466,11 @@ def compute_crossattn_loss(model, x_padded, condition, T_tok, layer_start=0, lay
         latent = x_padded
     else:
         latent = model.tokenizer.encode(x_padded.to(compute_dtype)).contiguous().float()
+
+    # Differentiable bridge from VAE device to DiT device for split-GPU gradient flow
+    if dit_device is not None and latent.device != torch.device(dit_device):
+        latent = latent.to(dit_device)
+
     B, C, T_lat, H_lat, W_lat = latent.shape
 
     def _build_live(cond):
@@ -626,7 +631,7 @@ def attack_single_video(
     inference, model, video_path, prompt,
     H, W, frames_to_extract, required_pixel_frames,
     T_tok, layer_start, layer_end, compute_dtype, args,
-    device="cuda", save_time=None
+    vae_device="cuda", dit_device="cuda", save_time=None
 ):
     """
     Run the full PGD attack for a single (video_path, prompt) pair.
@@ -644,15 +649,15 @@ def attack_single_video(
     if inference.offload_text_encoder:
         if model.text_encoder is not None:
             if hasattr(model.text_encoder, "model") and model.text_encoder.model is not None:
-                model.text_encoder.model = model.text_encoder.model.to(device).eval()
+                model.text_encoder.model = model.text_encoder.model.to(vae_device).eval()
         if _t5_mod.cosmos_encoder is not None:
             _t5_mod.cosmos_encoder.text_encoder = \
-                _t5_mod.cosmos_encoder.text_encoder.to(device).eval()
+                _t5_mod.cosmos_encoder.text_encoder.to(vae_device).eval()
 
     print(f"\nLoading video : {video_path}")
     if args.extend:
         full_video_uint8 = load_full_video(str(video_path), [H, W])
-        raw_full = normalize_video(full_video_uint8, device=device)
+        raw_full = normalize_video(full_video_uint8, device=vae_device)
         args._extend_full_video = raw_full.cpu()  # stored on CPU; forwarded to eval for saving
         print(f"Full video shape         : {raw_full.shape}")
         raw_padded = pad_video(raw_full, frames_to_extract, required_pixel_frames)
@@ -660,7 +665,7 @@ def attack_single_video(
         video_uint8 = load_and_preprocess_video(
             str(video_path), [H, W], frames_to_extract
         )
-        raw_cond = normalize_video(video_uint8, device=device)
+        raw_cond = normalize_video(video_uint8, device=vae_device)
         args._extend_full_video = None
         print(f"Conditioning frames shape: {raw_cond.shape}")
         raw_padded = pad_video(raw_cond, frames_to_extract, required_pixel_frames)
@@ -711,14 +716,28 @@ def attack_single_video(
 
     if inference.offload_tokenizer:
         if hasattr(model.tokenizer, "encoder") and model.tokenizer.encoder is not None:
-            model.tokenizer.encoder = model.tokenizer.encoder.to(device)
+            model.tokenizer.encoder = model.tokenizer.encoder.to(vae_device)
         torch.cuda.empty_cache()
 
     if inference.offload_diffusion_model:
-        model.net = model.net.to(device)
+        model.net = model.net.to(dit_device)
         if hasattr(model, "conditioner") and model.conditioner is not None:
-            model.conditioner = model.conditioner.to(device)
+            model.conditioner = model.conditioner.to(dit_device)
         torch.cuda.empty_cache()
+    elif vae_device != dit_device:
+        # split_gpus without full offloading: explicitly place DiT on dit_device
+        print(f"split_gpus: moving DiT → {dit_device}, VAE stays on {vae_device}")
+        model.net = model.net.to(dit_device)
+        if hasattr(model, "conditioner") and model.conditioner is not None:
+            model.conditioner = model.conditioner.to(dit_device)
+        torch.cuda.empty_cache()
+
+    # model.tensor_kwargs["device"] is hardcoded to "cuda" at model init; patch it
+    # so that model.denoise() sends tensors to the correct DiT device.
+    if vae_device != dit_device:
+        model.tensor_kwargs["device"] = dit_device
+        if hasattr(model, "tensor_kwargs_fp32"):
+            model.tensor_kwargs_fp32["device"] = dit_device
 
     # ------------------------------------------------------------------
     # 5. Freeze model parameters / enable VAE gradient
@@ -788,6 +807,8 @@ def attack_single_video(
     if target_condition_template is not None:
         with torch.no_grad():
             latent = model.tokenizer.encode(raw_padded.to(compute_dtype)).contiguous().float()
+            if vae_device != dit_device:
+                latent = latent.to(dit_device)
             print(f"Latent Shape {latent.shape}")
         # print("Computing spatial sim mask...")
         if args.mask:
@@ -815,11 +836,13 @@ def attack_single_video(
         num_latent_conditional_frames=args.num_latent_conditional_frames,
         sim_masks=sim_masks,
         loss_type=args.loss_type,
+        dit_device=dit_device if vae_device != dit_device else None,
     )
     if args.skip_latent:
         with torch.no_grad():
             latent = model.tokenizer.encode(raw_padded.to(compute_dtype)).contiguous().float()
             # latent = torch.empty_like(latent).uniform_(-3, 3)
+        # PGD optimises delta on vae_device; compute_crossattn_loss bridges to dit_device
         x_adv = pgd(latent, 0, lambda x: x, loss_fn, args.steps, args.alpha, args.eps, args.num_latent_conditional_frames)
     else:
         x_adv = pgd(raw_padded, 0, lambda x: x, loss_fn, args.steps, args.alpha, args.eps, frames_to_extract,
@@ -938,6 +961,12 @@ def main():
                              "Only applied when --denoise_steps > 1. "
                              "Matches the default used during normal inference. "
                              "Default: 7.0.")
+    parser.add_argument(
+        "--split_gpus", action="store_true",
+        help="Place the VAE encoder on cuda:0 and the DiT on cuda:1.  Gradient flows "
+             "across devices via differentiable .to() calls so a single backward pass "
+             "spans both GPUs, halving per-device peak VRAM.  Requires two CUDA devices.",
+    )
     args = parser.parse_args()
 
     if args.video_path is not None and args.prompt is None:
@@ -948,6 +977,14 @@ def main():
         args.experiment_name = experiment_name
 
     device = "cuda"
+    if args.split_gpus:
+        assert torch.cuda.device_count() >= 2, "--split_gpus requires at least 2 CUDA devices"
+        vae_device = "cuda:0"
+        dit_device  = "cuda:1"
+        print(f"split_gpus: VAE on {vae_device}, DiT on {dit_device}")
+    else:
+        vae_device = device
+        dit_device  = device
     H, W   = [int(x) for x in args.resolution.split(",")]
 
     # ------------------------------------------------------------------
@@ -1050,7 +1087,7 @@ def main():
             inference, model, video_path, prompt,
             H, W, frames_to_extract, required_pixel_frames,
             T_tok, layer_start, layer_end, compute_dtype, args,
-            device=device, save_time=save_time,
+            vae_device=vae_device, dit_device=dit_device, save_time=save_time,
         )
         all_x_adv.append(x_adv)
         base_name = str(video_path).split("/")[-1].split(".")[0] + "_adv.pt"
