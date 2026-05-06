@@ -103,7 +103,7 @@ from cosmos_predict2._src.predict2.models.text2world_model_rectified_flow import
 )
 import cosmos_predict2._src.predict2.inference.get_t5_emb as _t5_mod  # noqa: E402
 from probing.test_vae_encoder import load_and_preprocess_video, normalize_video, resize_input  # noqa: E402
-from attack.white_box import pgd, lab_freq_pgd
+from attack.white_box import pgd, freq_pgd, lab_freq_pgd
 from attack.eval_wm import eval, eval_latent
 from attack.shared_config import (
     ckpt_path, experiment_name, config_file
@@ -885,6 +885,7 @@ def attack_single_video(
             freq_cutoff=args.freq_cutoff,
             lab_budget_L=args.lab_budget_L,
             lab_budget_ab=args.lab_budget_ab,
+            freq_pixel_eps=args.freq_pixel_eps,
         )
     elif args.skip_latent:
         with torch.no_grad():
@@ -1023,6 +1024,11 @@ def main():
     parser.add_argument("--lab_budget_ab", type=float, default=20.0,
                         help="Maximum a*, b* channel perturbation (LAB units) for --lf_attack.  "
                              "Default: 20.0.")
+    parser.add_argument("--freq_pixel_eps", type=float, default=0.1,
+                        help="Maximum per-pixel perturbation from the frequency delta in [0,1] "
+                             "RGB space for --lf_attack.  The frequency delta is reconstructed "
+                             "to pixel space via irfft2 and clamped to this bound before being "
+                             "added to the LAB-perturbed image.  Default: 0.1.")
     parser.add_argument(
         "--split_gpus", action="store_true",
         help="Place the VAE encoder on cuda:0 and the DiT on cuda:1.  Gradient flows "
