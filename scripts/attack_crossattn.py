@@ -878,15 +878,20 @@ def attack_single_video(
     if getattr(args, "lf_attack", False):
         if args.skip_latent:
             raise ValueError("--lf_attack requires pixel-space optimisation and is incompatible with --skip_latent")
-        x_adv = lab_freq_pgd(
-            raw_padded, 0, lambda x: x, loss_fn,
-            args.steps, args.alpha,
-            frames_to_extract,
-            freq_cutoff=args.freq_cutoff,
-            lab_budget_L=args.lab_budget_L,
-            lab_budget_ab=args.lab_budget_ab,
-            freq_pixel_eps=args.freq_pixel_eps,
-        )
+        if getattr(args, "freq_oly", True):
+            x_adv = freq_pgd(raw_padded, 0, lambda x: x, loss_fn, args.steps, args.alpha, num_frames=frames_to_extract,
+             momentum=0.1, freq_cutoff=0.1,
+             lab_budget_L=args.lab_budget_L, lab_budget_ab=args.lab_budget_ab)
+        else:
+            x_adv = lab_freq_pgd(
+                raw_padded, 0, lambda x: x, loss_fn,
+                args.steps, args.alpha,
+                frames_to_extract,
+                freq_cutoff=args.freq_cutoff,
+                lab_budget_L=args.lab_budget_L,
+                lab_budget_ab=args.lab_budget_ab,
+                freq_pixel_eps=args.freq_pixel_eps,
+            )
     elif args.skip_latent:
         with torch.no_grad():
             latent = model.tokenizer.encode(raw_padded.to(compute_dtype)).contiguous().float()
@@ -977,6 +982,7 @@ def main():
                              "Default: all remaining blocks.")
     parser.add_argument("--load_diffusion_model", action="store_true",
                         help="Keep diffusion model on GPU (default: offload to CPU)")
+    parser.add_argument("--freq_only", action = "store_true")
     parser.add_argument("--load_text_encoder",    action="store_true",
                         help="Keep text encoder on GPU (default: offload to CPU)")
     parser.add_argument("--load_tokenizer",       action="store_true",
