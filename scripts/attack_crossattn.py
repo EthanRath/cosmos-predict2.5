@@ -881,7 +881,7 @@ def attack_single_video(
         if getattr(args, "freq_oly", True):
             x_adv = freq_pgd(raw_padded, 0, lambda x: x, loss_fn, args.steps, args.alpha, num_frames=frames_to_extract,
              momentum=0.1, freq_cutoff=0.1,
-             lab_budget_L=args.lab_budget_L, lab_budget_ab=args.lab_budget_ab)
+             lab_budget_L=args.lab_budget_L, lab_budget_ab=args.lab_budget_ab, freq_cutoff = args.freq_cutoff)
         else:
             x_adv = lab_freq_pgd(
                 raw_padded, 0, lambda x: x, loss_fn,
