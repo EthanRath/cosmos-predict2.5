@@ -652,10 +652,17 @@ def attack_single_video(
     inference, model, video_path, prompt,
     H, W, frames_to_extract, required_pixel_frames,
     T_tok, layer_start, layer_end, compute_dtype, args,
-    vae_device="cuda", dit_device="cuda", save_time=None
+    vae_device="cuda", dit_device="cuda", save_time=None,
+    preloaded_raw_padded=None,
+    benign_prompt_variants=None,
+    target_prompt_variants=None,
 ):
     """
     Run the full PGD attack for a single (video_path, prompt) pair.
+
+    If `preloaded_raw_padded` is provided, the file-loading step is skipped and
+    the supplied tensor is used as `raw_padded` directly.  `video_path` is then
+    only used as a label for saving outputs.
 
     Returns
     -------
@@ -665,7 +672,7 @@ def attack_single_video(
         save_time = int(time.time())
 
     # ------------------------------------------------------------------
-    # 2. Load video
+    # 2. Load video (or accept preloaded tensor from caller)
     # ------------------------------------------------------------------
     if inference.offload_text_encoder:
         if model.text_encoder is not None:
@@ -675,21 +682,26 @@ def attack_single_video(
             _t5_mod.cosmos_encoder.text_encoder = \
                 _t5_mod.cosmos_encoder.text_encoder.to(vae_device).eval()
 
-    print(f"\nLoading video : {video_path}")
-    if args.extend:
-        full_video_uint8 = load_full_video(str(video_path), [H, W])
-        raw_full = normalize_video(full_video_uint8, device=vae_device)
-        args._extend_full_video = raw_full.cpu()  # stored on CPU; forwarded to eval for saving
-        print(f"Full video shape         : {raw_full.shape}")
-        raw_padded = pad_video(raw_full, frames_to_extract, required_pixel_frames)
-    else:
-        video_uint8 = load_and_preprocess_video(
-            str(video_path), [H, W], frames_to_extract
-        )
-        raw_cond = normalize_video(video_uint8, device=vae_device)
+    if preloaded_raw_padded is not None:
+        raw_padded = preloaded_raw_padded.to(vae_device)
         args._extend_full_video = None
-        print(f"Conditioning frames shape: {raw_cond.shape}")
-        raw_padded = pad_video(raw_cond, frames_to_extract, required_pixel_frames)
+        print(f"\nUsing preloaded input : {video_path}")
+    else:
+        print(f"\nLoading video : {video_path}")
+        if args.extend:
+            full_video_uint8 = load_full_video(str(video_path), [H, W])
+            raw_full = normalize_video(full_video_uint8, device=vae_device)
+            args._extend_full_video = raw_full.cpu()  # stored on CPU; forwarded to eval for saving
+            print(f"Full video shape         : {raw_full.shape}")
+            raw_padded = pad_video(raw_full, frames_to_extract, required_pixel_frames)
+        else:
+            video_uint8 = load_and_preprocess_video(
+                str(video_path), [H, W], frames_to_extract
+            )
+            raw_cond = normalize_video(video_uint8, device=vae_device)
+            args._extend_full_video = None
+            print(f"Conditioning frames shape: {raw_cond.shape}")
+            raw_padded = pad_video(raw_cond, frames_to_extract, required_pixel_frames)
     print(f"Padded video shape       : {raw_padded.shape}")
 
     # ------------------------------------------------------------------
@@ -722,6 +734,28 @@ def attack_single_video(
         )
         target_data_batch["video"]             = video_bf16
         target_data_batch[IS_PREPROCESSED_KEY] = True
+
+    # Build T5 embeddings for all variant prompts while text encoder is still on GPU.
+    benign_var_data_batches: list = []
+    target_var_data_batches: list = []
+    if getattr(args, "rand_prompts", False):
+        for tag, variants, store in [
+            ("benign", benign_prompt_variants or [], benign_var_data_batches),
+            ("target", target_prompt_variants or [], target_var_data_batches),
+        ]:
+            if variants:
+                print(f"Building T5 embeddings for {len(variants)} {tag} prompt variants...")
+                for vp in variants:
+                    db = inference._get_data_batch_input(
+                        video=video_bf16,
+                        prompt=vp,
+                        num_conditional_frames=args.num_latent_conditional_frames,
+                        negative_prompt=negative_prompt,
+                        use_neg_prompt=True,
+                    )
+                    db["video"]             = video_bf16
+                    db[IS_PREPROCESSED_KEY] = True
+                    store.append(db)
 
     # ------------------------------------------------------------------
     # 4. Offloading sequence
@@ -816,6 +850,28 @@ def attack_single_video(
         target_condition_template = type(condition)(**tgt_dict)
         # edit_for_inference was already applied to condition (which we copied)
 
+    # ------------------------------------------------------------------
+    # 6c. Build condition templates for variant prompts
+    #     Each variant reuses all fields from condition (gt_frames, masks,
+    #     fps, etc.) and replaces only crossattn_emb with the variant T5
+    #     embeddings.  compute_crossattn_loss overwrites gt_frames at every
+    #     step via _build_live, so variants stay in sync with the perturbed x.
+    # ------------------------------------------------------------------
+    benign_cond_variants: list = []
+    target_cond_variants: list = []
+    if getattr(args, "rand_prompts", False):
+        for db in benign_var_data_batches:
+            var_dict = condition.to_dict(skip_underscore=False)
+            var_dict["crossattn_emb"] = db["t5_text_embeddings"]
+            benign_cond_variants.append(type(condition)(**var_dict))
+        for db in target_var_data_batches:
+            var_dict = condition.to_dict(skip_underscore=False)
+            var_dict["crossattn_emb"] = db["t5_text_embeddings"]
+            target_cond_variants.append(type(condition)(**var_dict))
+        if benign_cond_variants:
+            print(f"Built {len(benign_cond_variants)} benign + "
+                  f"{len(target_cond_variants)} target condition variants.")
+
     # When split_gpus is active, _get_data_batch_input moves all float tensors
     # to cuda:0 via .cuda(), but the DiT lives on dit_device.  Explicitly move
     # every tensor attribute of each condition object to dit_device so that
@@ -825,6 +881,10 @@ def attack_single_video(
         _move_condition_to_device(uncondition, dit_device)
         if target_condition_template is not None:
             _move_condition_to_device(target_condition_template, dit_device)
+        for vc in benign_cond_variants:
+            _move_condition_to_device(vc, dit_device)
+        for vc in target_cond_variants:
+            _move_condition_to_device(vc, dit_device)
 
     # ------------------------------------------------------------------
     # 7. PGD optimisation
@@ -859,22 +919,29 @@ def attack_single_video(
             analyze_sim_masks(sim_masks, spatial_grid=27, save_dir= "sim_analysis")
     
 
-    loss_fn = lambda x, y: compute_crossattn_loss(
-        model, x, condition, T_tok,
-        layer_start=layer_start,
-        layer_end=layer_end,
-        skip_latent=args.skip_latent,
-        max_att=args.max_att,
-        denoise_steps=args.denoise_steps,
-        uncondition=uncondition if args.denoise_steps > 1 else None,
-        guidance_scale=args.guidance_scale,
-        target_condition=target_condition_template,
-        noise_seed=0 if target_condition_template is not None else None,
-        num_latent_conditional_frames=args.num_latent_conditional_frames,
-        sim_masks=sim_masks,
-        loss_type=args.loss_type,
-        dit_device=dit_device if vae_device != dit_device else None,
-    )
+    _use_variants = getattr(args, "rand_prompts", False) and bool(benign_cond_variants)
+
+    def loss_fn(x, y):
+        c = random.choice(benign_cond_variants) if _use_variants else condition
+        t = (random.choice(target_cond_variants)
+             if (_use_variants and target_cond_variants)
+             else target_condition_template)
+        return compute_crossattn_loss(
+            model, x, c, T_tok,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            skip_latent=args.skip_latent,
+            max_att=args.max_att,
+            denoise_steps=args.denoise_steps,
+            uncondition=uncondition if args.denoise_steps > 1 else None,
+            guidance_scale=args.guidance_scale,
+            target_condition=t,
+            noise_seed=0 if t is not None else None,
+            num_latent_conditional_frames=args.num_latent_conditional_frames,
+            sim_masks=sim_masks,
+            loss_type=args.loss_type,
+            dit_device=dit_device if vae_device != dit_device else None,
+        )
     if getattr(args, "lf_attack", False):
         if args.skip_latent:
             raise ValueError("--lf_attack requires pixel-space optimisation and is incompatible with --skip_latent")
